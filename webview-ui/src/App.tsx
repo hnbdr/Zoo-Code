@@ -55,6 +55,7 @@ const App = () => {
 	useThemeFixtureProbe()
 
 	const {
+		currentTaskId,
 		didHydrateState,
 		showWelcome,
 		settingsImportedAt,
@@ -259,7 +260,17 @@ const App = () => {
 					targetTab={currentMarketplaceTab as "mcp" | "mode" | undefined}
 				/>
 			)}
+			{/* ===== REMOUNT POINT #1 (whole chat) =====
+			    Keying <ChatView> by currentTaskId unmounts the ENTIRE previous chat's
+			    component tree on task switch: every closure context (handleMessage,
+			    handleKeyDown, handleSecondaryButtonClick, itemContent, …), every window
+			    listener (useEvent cleanup runs on unmount), every ref and memoized child
+			    is torn down, so nothing can pin the old chat's message arrays or the
+			    messageCache entries. The cache is cleared in the same tick by
+			    ExtensionStateContextProvider. Tab switches keep the component mounted
+			    (isHidden) so no chat state is lost there. */}
 			<ChatView
+				key={currentTaskId ?? "no-task"}
 				ref={chatViewRef}
 				isHidden={tab !== "chat"}
 				showAnnouncement={showAnnouncement}
