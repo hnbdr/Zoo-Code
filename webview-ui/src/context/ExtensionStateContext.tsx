@@ -1,4 +1,4 @@
-import React, { createContext, useCallback, useEffect, useState } from "react"
+import React, { createContext, useCallback, useEffect, useRef, useState } from "react"
 
 import {
 	type ProviderSettings,
@@ -33,6 +33,20 @@ import { experimentDefault } from "@roo/experiments"
 
 import { vscode } from "@src/utils/vscode"
 import { convertTextMateToHljs } from "@src/utils/textMateToHljs"
+import { StringCache } from "@src/utils/stringCache"
+
+// POC: two StringCache instances (class taking a filter in the constructor),
+// created once per webview lifetime (module import time):
+//
+//   historyCache — task data (taskHistory / currentTaskItem). Cross-task: the
+//                  list holds EVERY task ever run in this workspace and is
+//                  never cleared on task switch. No filter.
+//   messageCache — clineMessages. Task-scoped, with the partial filter
+//                  `(msg) => !msg.partial`: partial (mid-stream) messages
+//                  pass through by reference. Cleared by the provider on task
+//                  switch, when no component references the cached strings.
+const historyCache = new StringCache()
+const messageCache = new StringCache((msg) => !msg.partial)
 
 export interface ExtensionStateContextType extends ExtensionState {
 	historyPreviewCollapsed?: boolean // Add the new state property
@@ -283,9 +297,22 @@ export const ExtensionStateContextProvider: React.FC<{
 	children: React.ReactNode
 	initialState?: ExtensionStateProviderInitialState
 }> = ({ children, initialState }) => {
-	const [state, setState] = useState<ExtensionState>(() =>
-		mergeExtensionState(createInitialExtensionState(), initialState ?? {}),
-	)
+	// POC: task-scoped messageCache (cleared on task switch, when the whole old
+	// ChatView tree is unmounted — key={currentTaskId} in App.tsx) vs. the
+	// cross-task historyCache (the full history list persists across switches).
+	const prevTaskIdRef = useRef<string | undefined>(undefined)
+
+	const [state, setState] = useState<ExtensionState>(() => {
+		const mergedState = mergeExtensionState(createInitialExtensionState(), initialState ?? {})
+		messageCache.intern(mergedState.clineMessages)
+		if (mergedState.taskHistory.length > 0) {
+			historyCache.intern(mergedState.taskHistory)
+		}
+		if (mergedState.currentTaskItem) {
+			historyCache.intern(mergedState.currentTaskItem)
+		}
+		return mergedState
+	})
 
 	const [didHydrateState, setDidHydrateState] = useState(false)
 	const [showWelcome, setShowWelcome] = useState(false)
@@ -341,6 +368,30 @@ export const ExtensionStateContextProvider: React.FC<{
 			switch (message.type) {
 				case "state": {
 					const newState = message.state ?? {}
+					// Task switch: drop interned strings from the previous task before
+					// interning the new task's messages. The whole old ChatView tree is
+					// unmounted at this point (key={currentTaskId} in App.tsx), so the
+					// strings are unreachable. historyCache is NOT cleared — it is
+					// cross-task data (the full history list persists across switches).
+					const newTaskId = newState.currentTaskId
+					if (newTaskId !== undefined && newTaskId !== prevTaskIdRef.current) {
+						messageCache.clear()
+						prevTaskIdRef.current = newTaskId
+					}
+					// Intern BEFORE setState: React state updaters must stay pure, and
+					// the same text content re-sent across streaming pushes should reuse
+					// one canonical string instance instead of N deserialized clones.
+					// Partials are rejected by messageCache's filter (they are transient
+					// and replaced by the next push).
+					if (newState.clineMessages) {
+						messageCache.intern(newState.clineMessages)
+					}
+					if (newState.taskHistory) {
+						historyCache.intern(newState.taskHistory)
+					}
+					if (newState.currentTaskItem) {
+						historyCache.intern(newState.currentTaskItem)
+					}
 					setState((prevState) => mergeExtensionState(prevState, newState))
 					setShowWelcome(!checkExistKey(newState.apiConfiguration, newState.zooCodeIsAuthenticated))
 					setDidHydrateState(true)
@@ -404,7 +455,12 @@ export const ExtensionStateContextProvider: React.FC<{
 					break
 				}
 				case "messageUpdated": {
+					// Intern the incoming message so its string fields point to the same
+					// canonical instances as the ones already in state (e.g. the partial
+					// text being replaced by its grown version). Partials are skipped
+					// inside the utility — they are transient and replaced by the next push.
 					const clineMessage = message.clineMessage!
+					messageCache.intern(clineMessage)
 					setState((prevState) => {
 						// worth noting it will never be possible for a more up-to-date message to be sent here or in normal messages post since the presentAssistantContent function uses lock
 						const lastIndex = findLastIndex(prevState.clineMessages, (msg) => msg.ts === clineMessage.ts)
@@ -467,8 +523,11 @@ export const ExtensionStateContextProvider: React.FC<{
 					break
 				}
 				case "taskHistoryUpdated": {
-					// Efficiently update just the task history without replacing entire state
+					// Efficiently update just the task history without replacing entire state.
+					// Intern into the cross-task cache: the list holds EVERY task ever run
+					// in this workspace and persists across task switches.
 					if (message.taskHistory !== undefined) {
+						historyCache.intern(message.taskHistory)
 						setState((prevState) => ({
 							...prevState,
 							taskHistory: message.taskHistory!,
@@ -477,10 +536,16 @@ export const ExtensionStateContextProvider: React.FC<{
 					break
 				}
 				case "taskHistoryItemUpdated": {
-					const item = message.taskHistoryItem
-					if (!item) {
+					// Intern into the cross-task historyCache: updates can arrive for
+					// parent/child tasks unrelated to the one being viewed (delegation),
+					// so this item must share the same canonical strings as the full
+					// history list.
+					const rawItem = message.taskHistoryItem
+					if (!rawItem) {
 						break
 					}
+					historyCache.intern(rawItem)
+					const item = rawItem
 					setState((prevState) => {
 						const existingIndex = prevState.taskHistory.findIndex((h) => h.id === item.id)
 						let nextHistory: typeof prevState.taskHistory
