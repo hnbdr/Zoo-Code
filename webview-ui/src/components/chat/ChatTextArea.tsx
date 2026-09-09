@@ -11,6 +11,7 @@ import { Mode, getAllModes } from "@roo/modes"
 
 import { vscode } from "@src/utils/vscode"
 import { useExtensionState } from "@src/context/ExtensionStateContext"
+import { useClineMessages } from "@src/hooks/useClineMessages"
 import { useAppTranslation } from "@src/i18n/TranslationContext"
 import {
 	ContextMenuOptionType,
@@ -100,11 +101,15 @@ export const ChatTextArea = forwardRef<HTMLTextAreaElement, ChatTextAreaProps>(
 			pinnedApiConfigs,
 			togglePinnedApiConfig,
 			taskHistory,
-			clineMessages,
 			commands,
 			enterBehavior,
 			lockApiConfigAcrossModes,
 		} = useExtensionState()
+
+		// Commit 2: clineMessages moved out of the context state into
+		// ClineMessagesStore. ChatTextArea only consumes messages for prompt
+		// history navigation (user interaction), per plan §7.4.
+		const clineMessages = useClineMessages()
 
 		// Find the ID and display text for the currently selected API configuration.
 		const { currentConfigId, displayName } = useMemo(() => {

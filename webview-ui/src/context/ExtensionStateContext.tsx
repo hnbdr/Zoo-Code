@@ -25,8 +25,6 @@ import {
 	DEFAULT_DIFF_FUZZY_THRESHOLD,
 } from "@roo-code/types"
 
-import { findLastIndex } from "@roo/array"
-
 import { checkExistKey } from "@roo/checkExistApiConfig"
 import { Mode, defaultModeSlug, defaultPrompts } from "@roo/modes"
 import { CustomSupportPrompts } from "@roo/support-prompt"
@@ -34,8 +32,29 @@ import { experimentDefault } from "@roo/experiments"
 
 import { vscode } from "@src/utils/vscode"
 import { convertTextMateToHljs } from "@src/utils/textMateToHljs"
+import { StringCache } from "@src/utils/stringCache"
 
-export interface ExtensionStateContextType extends ExtensionState {
+import { clineMessagesStore } from "@src/context/stores/clineMessagesStore"
+
+// POC: one StringCache instance (class taking a filter in the constructor),
+// created once per webview lifetime (module import time):
+//
+//   historyCache — task data (taskHistory / currentTaskItem). Cross-task: the
+//                  list holds EVERY task ever run in this workspace and is
+//                  never cleared on task switch. No filter.
+//   messageCache — clineMessages. Moved into ClineMessagesStore (Commit 2):
+//                  the store owns its own task-scoped StringCache with the
+//                  partial filter `(msg) => !msg.partial` and clears it on
+//                  task switch / clear(). The provider no longer touches it.
+const historyCache = new StringCache()
+
+// Commit 2: `clineMessages` / `clineMessagesSeq` are owned by ClineMessagesStore
+// (a useSyncExternalStore slice) and are removed from the context state, so a
+// streaming push no longer recreates the context value (see plans §Commit 2).
+// The type stays the full ExtensionState minus those two IPC-contract fields.
+export type ContextState = Omit<ExtensionState, "clineMessages" | "clineMessagesSeq">
+
+export interface ExtensionStateContextType extends ContextState {
 	historyPreviewCollapsed?: boolean // Add the new state property
 	didHydrateState: boolean
 	showWelcome: boolean
@@ -156,35 +175,42 @@ export interface ExtensionStateContextType extends ExtensionState {
 
 export const ExtensionStateContext = createContext<ExtensionStateContextType | undefined>(undefined)
 
-export const mergeExtensionState = (prevState: ExtensionState, newState: Partial<ExtensionState>) => {
-	const { customModePrompts: prevCustomModePrompts, experiments: prevExperiments, ...prevRest } = prevState
+export const mergeExtensionState = (prevState: ContextState, newState: Partial<ExtensionState>) => {
+	// Commit 2: strip the streaming slice from BOTH inputs. ContextState omits
+	// clineMessages / clineMessagesSeq, but the structural type allows callers to
+	// hand in a value that still carries them (test fixtures simulate a
+	// pre-Commit-2 snapshot), and leaking them through prevRest would re-introduce
+	// the slice into the context value — the exact re-render source this refactor
+	// removes. The store applies its own seq guard internally.
+	const {
+		customModePrompts: prevCustomModePrompts,
+		experiments: prevExperiments,
+		clineMessages: _streamingMessagesPrev,
+		clineMessagesSeq: _streamingSeqPrev,
+		...prevRest
+	} = prevState as ContextState & {
+		clineMessages?: ExtensionState["clineMessages"]
+		clineMessagesSeq?: ExtensionState["clineMessagesSeq"]
+	}
 
 	const {
 		apiConfiguration,
 		customModePrompts: newCustomModePrompts,
 		customSupportPrompts,
 		experiments: newExperiments,
+		// Commit 2: the streaming slice lives in ClineMessagesStore. Strip it here so
+		// it never leaks back into the context state (which would re-create the
+		// context value on every streaming flush). The store applies the seq guard
+		// internally (see replaceAll in clineMessagesStore.ts) and clears on task
+		// switch, so this merge is purely about the non-streaming fields.
+		clineMessages: _streamingMessages,
+		clineMessagesSeq: _streamingSeq,
 		...newRest
 	} = newState
 
 	const customModePrompts = { ...prevCustomModePrompts, ...(newCustomModePrompts ?? {}) }
 	const experiments = { ...prevExperiments, ...(newExperiments ?? {}) }
 	const rest = { ...prevRest, ...newRest }
-
-	// Protect clineMessages from stale state pushes using sequence numbering.
-	// Multiple async event sources (cloud auth, settings, task streaming) can trigger
-	// concurrent state pushes. If a stale push arrives after a newer one, its clineMessages
-	// would overwrite the newer messages. The sequence number prevents this by only applying
-	// clineMessages when the incoming seq is strictly greater than the last applied seq.
-	if (
-		newState.clineMessagesSeq !== undefined &&
-		prevState.clineMessagesSeq !== undefined &&
-		newState.clineMessagesSeq <= prevState.clineMessagesSeq &&
-		newState.clineMessages !== undefined
-	) {
-		rest.clineMessages = prevState.clineMessages
-		rest.clineMessagesSeq = prevState.clineMessagesSeq
-	}
 
 	// Note that we completely replace the previous apiConfiguration and customSupportPrompts objects
 	// with new ones since the state that is broadcast is the entire objects so merging is not necessary.
@@ -197,10 +223,9 @@ export const mergeExtensionState = (prevState: ExtensionState, newState: Partial
 	}
 }
 
-const createInitialExtensionState = (): ExtensionState => ({
+const createInitialExtensionState = (): ContextState => ({
 	apiConfiguration: {},
 	version: "",
-	clineMessages: [],
 	taskHistory: [],
 	shouldShowAnnouncement: false,
 	allowedCommands: [],
@@ -284,9 +309,16 @@ export const ExtensionStateContextProvider: React.FC<{
 	children: React.ReactNode
 	initialState?: ExtensionStateProviderInitialState
 }> = ({ children, initialState }) => {
-	const [state, setState] = useState<ExtensionState>(() =>
-		mergeExtensionState(createInitialExtensionState(), initialState ?? {}),
-	)
+	const [state, setState] = useState<ContextState>(() => {
+		const mergedState = mergeExtensionState(createInitialExtensionState(), initialState ?? {})
+		if (mergedState.taskHistory.length > 0) {
+			historyCache.intern(mergedState.taskHistory)
+		}
+		if (mergedState.currentTaskItem) {
+			historyCache.intern(mergedState.currentTaskItem)
+		}
+		return mergedState
+	})
 
 	const [didHydrateState, setDidHydrateState] = useState(false)
 	const [showWelcome, setShowWelcome] = useState(false)
@@ -342,6 +374,18 @@ export const ExtensionStateContextProvider: React.FC<{
 			switch (message.type) {
 				case "state": {
 					const newState = message.state ?? {}
+					// Commit 2: clineMessages / clineMessagesSeq are owned by
+					// ClineMessagesStore (self-hydrating listener — §7.3). It seq-guards
+					// full-state posts, interns the messages and clears on task switch,
+					// so the provider only merges the remaining fields. historyCache
+					// below is cross-task data (the full history list persists across
+					// switches).
+					if (newState.taskHistory) {
+						historyCache.intern(newState.taskHistory)
+					}
+					if (newState.currentTaskItem) {
+						historyCache.intern(newState.currentTaskItem)
+					}
 					setState((prevState) => mergeExtensionState(prevState, newState))
 					setShowWelcome(!checkExistKey(newState.apiConfiguration, newState.zooCodeIsAuthenticated))
 					setDidHydrateState(true)
@@ -402,28 +446,6 @@ export const ExtensionStateContextProvider: React.FC<{
 				}
 				case "commands": {
 					setCommands(message.commands ?? [])
-					break
-				}
-				case "messageUpdated": {
-					const clineMessage = message.clineMessage!
-					setState((prevState) => {
-						// worth noting it will never be possible for a more up-to-date message to be sent here or in normal messages post since the presentAssistantContent function uses lock
-						const lastIndex = findLastIndex(prevState.clineMessages, (msg) => msg.ts === clineMessage.ts)
-						if (lastIndex !== -1) {
-							const newClineMessages = [...prevState.clineMessages]
-							newClineMessages[lastIndex] = clineMessage
-							return { ...prevState, clineMessages: newClineMessages }
-						}
-						// Log a warning if messageUpdated arrives for a timestamp not in the
-						// frontend's clineMessages. With the seq guard and cloud event isolation
-						// (layers 1+2), this should not happen under normal conditions. If it
-						// does, it signals a state synchronization issue worth investigating.
-						console.warn(
-							`[messageUpdated] Received update for unknown message ts=${clineMessage.ts}, dropping. ` +
-								`Frontend has ${prevState.clineMessages.length} messages.`,
-						)
-						return prevState
-					})
 					break
 				}
 				case "skills": {
@@ -513,6 +535,17 @@ export const ExtensionStateContextProvider: React.FC<{
 			window.removeEventListener("message", handleMessage)
 		}
 	}, [handleMessage])
+
+	// Commit 2: ClineMessagesStore self-hydrates from the window "message" events
+	// (§7.3). Attach its listener for the provider's lifetime; the store handles
+	// `state` posts (seq-guarded replaceAll + task-switch clear) and streaming
+	// `messageUpdated` pushes itself, so this provider never re-renders on them.
+	useEffect(() => {
+		clineMessagesStore.start()
+		return () => {
+			clineMessagesStore.stop()
+		}
+	}, [])
 
 	useEffect(() => {
 		vscode.postMessage({ type: "webviewDidLaunch" })

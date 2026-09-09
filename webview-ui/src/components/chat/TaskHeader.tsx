@@ -11,14 +11,12 @@ import {
 } from "lucide-react"
 import prettyBytes from "pretty-bytes"
 
-import type { ClineMessage } from "@roo-code/types"
-
 import { getModelMaxOutputTokens } from "@roo/api"
-
 import { formatLargeNumber } from "@src/utils/format"
 import { cn } from "@src/lib/utils"
 import { StandardTooltip, Button, Table, TableBody, TableRow, TableCell, CircularProgress } from "@src/components/ui"
 import { useExtensionState } from "@src/context/ExtensionStateContext"
+import { useClineMessagesSelector } from "@src/hooks/useClineMessages"
 import { useSelectedModel } from "@/components/ui/hooks/useSelectedModel"
 import { vscode } from "@src/utils/vscode"
 
@@ -30,7 +28,6 @@ import { TodoListDisplay } from "./TodoListDisplay"
 import { LucideIconButton } from "./LucideIconButton"
 
 export interface TaskHeaderProps {
-	task: ClineMessage
 	tokensIn: number
 	tokensOut: number
 	cacheWrites?: number
@@ -47,7 +44,6 @@ export interface TaskHeaderProps {
 }
 
 const TaskHeader = ({
-	task,
 	tokensIn,
 	tokensOut,
 	cacheWrites,
@@ -64,6 +60,10 @@ const TaskHeader = ({
 }: TaskHeaderProps) => {
 	const { t } = useTranslation()
 	const { apiConfiguration, currentTaskItem } = useExtensionState()
+	// Task text: the first message, read from the store via a selector. The
+	// store deduplicates messages by ts (canonical instances), keeping the
+	// at(0) reference stable across identically-shaped full-state posts.
+	const task = useClineMessagesSelector((messages) => messages.at(0))
 	const { id: modelId, info: model } = useSelectedModel(apiConfiguration)
 	const [isTaskExpanded, setIsTaskExpanded] = useState(false)
 
@@ -85,6 +85,12 @@ const TaskHeader = ({
 	)
 	// vscode-lm reports maxTokens: -1 (unlimited); a negative reserve must not distort the window math.
 	const reservedForOutput = maxTokens && maxTokens > 0 ? maxTokens : 0
+
+	// TaskHeader is only rendered by ChatView while a task exists (messages.at(0)
+	// is set); the guard keeps the task accesses below type-safe regardless.
+	if (!task) {
+		return null
+	}
 
 	const condenseButton = (
 		<LucideIconButton
