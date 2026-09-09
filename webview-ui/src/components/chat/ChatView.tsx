@@ -1518,7 +1518,11 @@ const ChatViewComponent: React.ForwardRefRenderFunction<ChatViewRef, ChatViewPro
 			// regular message
 			return (
 				<ChatRow
-					key={messageOrGroup.ts}
+					// ===== REMOUNT POINT #3 (per message row) =====
+					// Keying by ts + partial/full status remounts a ChatRow whenever a
+					// partial message is replaced by its grown/final version, releasing
+					// the closures of the previous row instance.
+					key={`${messageOrGroup.ts}-${messageOrGroup.partial ? "partial" : "full"}`}
 					message={messageOrGroup}
 					isExpanded={expandedRows[messageOrGroup.ts] || false}
 					onToggleExpand={toggleRowExpansion} // This was already stabilized
@@ -1572,8 +1576,13 @@ const ChatViewComponent: React.ForwardRefRenderFunction<ChatViewRef, ChatViewPro
 		],
 	)
 
+	// ===== REMOUNT POINT #2 (message list) =====
+	// computeMessageKey drives React reconciliation: whenever a message's ts or its
+	// partial/full status changes, the corresponding ChatRow is remounted, dropping
+	// the previous row instance's closures and DOM.
 	const computeMessageKey = useCallback(
-		(index: number, messageOrGroup: ClineMessage) => `${messageOrGroup.ts}-${index}`,
+		(index: number, messageOrGroup: ClineMessage) =>
+			`${messageOrGroup.ts}-${index}-${messageOrGroup.partial ? "partial" : "full"}`,
 		[],
 	)
 
