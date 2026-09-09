@@ -18,7 +18,7 @@ import {
 } from "@roo-code/types"
 import { TelemetryService } from "@roo-code/telemetry"
 
-import { MODEL_FETCH_TIMEOUT_MS, Task } from "../Task"
+import { MESSAGE_UPDATE_DEBOUNCE_MS, MODEL_FETCH_TIMEOUT_MS, Task } from "../Task"
 import { SYSTEM_PROMPT } from "../../prompts/system"
 import { createRateLimitClock } from "../RateLimitClock"
 import { summarizeConversation } from "../../condense"
@@ -2756,51 +2756,105 @@ describe("Cline", () => {
 			expect(mockProvider.flushPostStateToWebviewThrottled).not.toHaveBeenCalled()
 		})
 
-		it("waits for a new partial message flush before a following message update", async () => {
-			const task = new Task({
-				provider: mockProvider,
-				apiConfiguration: mockApiConfig,
-				task: "test task",
-				startTask: false,
-			})
-			const taskAccess = getTaskTestAccess(task)
-			vi.spyOn(taskAccess, "saveClineMessages").mockResolvedValue(true)
-			let releaseFlush!: () => void
-			const pendingFlush = new Promise<void>((resolve) => {
-				releaseFlush = resolve
-			})
-			const flushSpy = vi.mocked(mockProvider.flushPostStateToWebviewThrottled).mockReturnValueOnce(pendingFlush)
-			const updatePostSpy = vi.mocked(mockProvider.postMessageToWebview)
-			const partialMessage = {
-				ts: 1,
-				type: "say" as const,
-				say: "text" as const,
-				text: "partial message",
-				partial: true,
-			}
-			let partialAddSettled = false
-			const addThenUpdate = taskAccess.addToClineMessages(partialMessage).then(async () => {
-				partialAddSettled = true
+		it("debounces per-token partial updates into a single messageUpdated post per window", async () => {
+			vi.useFakeTimers()
+			try {
+				const task = new Task({
+					provider: mockProvider,
+					apiConfiguration: mockApiConfig,
+					task: "test task",
+					startTask: false,
+				})
+				const taskAccess = getTaskTestAccess(task)
+				vi.spyOn(taskAccess, "saveClineMessages").mockResolvedValue(true)
+				const updatePostSpy = vi.mocked(mockProvider.postMessageToWebview)
+				const partialMessage = {
+					ts: 1,
+					type: "say" as const,
+					say: "text" as const,
+					text: "partial message",
+					partial: true,
+				}
+				await taskAccess.addToClineMessages(partialMessage)
 				await taskAccess.updateClineMessage({ ...partialMessage, text: "updated partial" })
-			})
+				await taskAccess.updateClineMessage({ ...partialMessage, text: "updated partial 2" })
+				await taskAccess.updateClineMessage({ ...partialMessage, text: "updated partial 3" })
 
-			await Promise.resolve()
-			expect(mockProvider.postStateToWebviewThrottled).toHaveBeenCalledWith()
-			expect(flushSpy).toHaveBeenCalledWith()
-			expect(partialAddSettled).toBe(false)
-			expect(updatePostSpy).not.toHaveBeenCalled()
+				// None of the 3 partial updates posted yet — they are debounced.
+				expect(updatePostSpy).not.toHaveBeenCalled()
 
-			releaseFlush()
-			await addThenUpdate
+				// After the default flush window the single post carries the latest state.
+				vi.advanceTimersByTime(MESSAGE_UPDATE_DEBOUNCE_MS)
 
-			expect(flushSpy.mock.invocationCallOrder[0]).toBeLessThan(updatePostSpy.mock.invocationCallOrder[0])
-			expect(updatePostSpy).toHaveBeenCalledWith({
-				type: "messageUpdated",
-				clineMessage: {
-					...partialMessage,
-					text: "updated partial",
-				},
-			})
+				expect(updatePostSpy).toHaveBeenCalledTimes(1)
+				expect(updatePostSpy).toHaveBeenCalledWith({
+					type: "messageUpdated",
+					clineMessage: {
+						...partialMessage,
+						text: "updated partial 3",
+					},
+				})
+			} finally {
+				vi.useRealTimers()
+			}
+		})
+
+		it("waits for a new partial message flush before a following message update", async () => {
+			vi.useFakeTimers()
+			try {
+				const task = new Task({
+					provider: mockProvider,
+					apiConfiguration: mockApiConfig,
+					task: "test task",
+					startTask: false,
+				})
+				const taskAccess = getTaskTestAccess(task)
+				vi.spyOn(taskAccess, "saveClineMessages").mockResolvedValue(true)
+				let releaseFlush!: () => void
+				const pendingFlush = new Promise<void>((resolve) => {
+					releaseFlush = resolve
+				})
+				const flushSpy = vi
+					.mocked(mockProvider.flushPostStateToWebviewThrottled)
+					.mockReturnValueOnce(pendingFlush)
+				const updatePostSpy = vi.mocked(mockProvider.postMessageToWebview)
+				const partialMessage = {
+					ts: 1,
+					type: "say" as const,
+					say: "text" as const,
+					text: "partial message",
+					partial: true,
+				}
+				let partialAddSettled = false
+				const addThenUpdate = taskAccess.addToClineMessages(partialMessage).then(async () => {
+					partialAddSettled = true
+					await taskAccess.updateClineMessage({ ...partialMessage, text: "updated partial" })
+				})
+
+				await Promise.resolve()
+				expect(mockProvider.postStateToWebviewThrottled).toHaveBeenCalledWith()
+				expect(flushSpy).toHaveBeenCalledWith()
+				expect(partialAddSettled).toBe(false)
+				expect(updatePostSpy).not.toHaveBeenCalled()
+
+				releaseFlush()
+				await addThenUpdate
+
+				// The partial update is debounced — advance the debounce window so the
+				// messageUpdated post is observable after the state flush completed.
+				vi.advanceTimersByTime(MESSAGE_UPDATE_DEBOUNCE_MS)
+
+				expect(flushSpy.mock.invocationCallOrder[0]).toBeLessThan(updatePostSpy.mock.invocationCallOrder[0])
+				expect(updatePostSpy).toHaveBeenCalledWith({
+					type: "messageUpdated",
+					clineMessage: {
+						...partialMessage,
+						text: "updated partial",
+					},
+				})
+			} finally {
+				vi.useRealTimers()
+			}
 		})
 	})
 

@@ -6,6 +6,7 @@ import { v7 as uuidv7 } from "uuid"
 import EventEmitter from "events"
 
 import { AskIgnoredError } from "./AskIgnoredError"
+import { KeyedDebouncer } from "../../utils/KeyedDebouncer"
 import { RateLimitClock, createRateLimitClock } from "./RateLimitClock"
 
 import { Anthropic } from "@anthropic-ai/sdk"
@@ -154,6 +155,12 @@ const DEFAULT_USAGE_COLLECTION_TIMEOUT_MS = 5000 // 5 seconds
 // Task -> generateSystemPrompt -> ClineProvider -> Task circular import.
 export const MODEL_FETCH_TIMEOUT_MS = 5_000
 const QUEUED_FEEDBACK_SAVE_RETRY_DELAYS_MS = [250, 1_000, 4_000] as const
+
+/**
+ * Debounce window for per-token `messageUpdated` posts: at most one post per
+ * window carrying the latest state of each updated message.
+ */
+export const MESSAGE_UPDATE_DEBOUNCE_MS = 500
 
 type QueuedAskResolution = { response: ClineAskResponse; requiresDurableAck: boolean }
 
@@ -322,6 +329,11 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 
 	providerRef: WeakRef<ClineProvider>
 	private readonly globalStoragePath: string
+	/**
+	 * Debounces per-token `messageUpdated` posts so the webview gets at most one
+	 * post per window carrying the latest state of each updated message.
+	 */
+	private readonly messageUpdateDebouncer: KeyedDebouncer<number, ClineMessage>
 	abort: boolean = false
 	currentRequestAbortController?: AbortController
 	/**
@@ -603,6 +615,20 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 		this.consecutiveMistakeLimit = consecutiveMistakeLimit ?? DEFAULT_CONSECUTIVE_MISTAKE_LIMIT
 		this.providerRef = new WeakRef(provider)
 		this.globalStoragePath = provider.context.globalStorageUri.fsPath
+		// Debounce the per-token messageUpdated stream (at most one post per
+		// MESSAGE_UPDATE_DEBOUNCE_MS carrying the latest state of each updated
+		// message). The provider is held weakly (matching providerRef semantics)
+		// so a disposed task never resurrects the provider.
+		this.messageUpdateDebouncer = new KeyedDebouncer<number, ClineMessage>((messages) => {
+			for (const message of messages) {
+				void this.providerRef
+					.deref()
+					?.postMessageToWebview({ type: "messageUpdated", clineMessage: message })
+					.catch((error) => {
+						console.error("[Task#messageUpdateDebouncer] postMessageToWebview failed:", error)
+					})
+			}
+		}, MESSAGE_UPDATE_DEBOUNCE_MS)
 		this.diffViewProvider = new DiffViewProvider(this.cwd, this)
 		this.enableCheckpoints = enableCheckpoints
 		this.checkpointTimeout = checkpointTimeout
@@ -1354,8 +1380,14 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 	 * Non-partial messages are synced to cloud telemetry if not already synced.
 	 */
 	private async updateClineMessage(message: ClineMessage) {
-		const provider = this.providerRef.deref()
-		await provider?.postMessageToWebview({ type: "messageUpdated", clineMessage: message })
+		// Debounce the per-token stream keyed by message ts. A finalized message
+		// (partial === false) flushes immediately — a UI boundary where waiting
+		// for the window would add visible latency. The sync emit below still
+		// fires per message — api.ts depends on it.
+		this.messageUpdateDebouncer.enqueue(message.ts, message)
+		if (message.partial === false) {
+			this.messageUpdateDebouncer.flushNow()
+		}
 		this.emit(RooCodeEventName.Message, { action: "updated", message })
 
 		// Check if we should sync to cloud and haven't already synced this message
@@ -2786,6 +2818,14 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 			this.messageQueueService.dispose()
 		} catch (error) {
 			console.error("Error disposing message queue:", error)
+		}
+
+		// Flush any debounced streaming updates and stop the timer so a disposed
+		// task never posts again (and never leaks the timer handle).
+		try {
+			this.messageUpdateDebouncer.dispose()
+		} catch (error) {
+			console.error("Error disposing message update debouncer:", error)
 		}
 
 		// Remove all event listeners to prevent memory leaks.
