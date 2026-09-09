@@ -2,9 +2,11 @@ import { providerIdentifiers } from "@roo-code/types"
 // npx vitest src/components/chat/__tests__/TaskHeader.spec.tsx
 
 import React from "react"
-import { renderWithExtensionState, screen, fireEvent } from "@/utils/test-utils"
+import { renderWithExtensionState, screen, fireEvent, act } from "@/utils/test-utils"
 
-import type { ProviderSettings } from "@roo-code/types"
+import type { ClineMessage, ProviderSettings } from "@roo-code/types"
+
+import { clineMessagesStore } from "@src/context/stores/clineMessagesStore"
 
 import TaskHeader, { TaskHeaderProps } from "../TaskHeader"
 
@@ -90,9 +92,21 @@ vi.mock("@roo/api", () => ({
 	getModelMaxOutputTokens: () => mockMaxOutputTokens,
 }))
 
+// Mock Mention so task.text renders as plain text without pulling in the
+// @roo/context-mentions regex dependency.
+vi.mock("../Mention", () => ({
+	Mention: ({ text }: { text?: string }) => <span>{text}</span>,
+}))
+
+// Commit 2: TaskHeader reads the task message through the REAL
+// useClineMessagesSelector (no module-level hook mock anymore), so every test
+// hydrates the store singleton directly. Task-say message factory matching the
+// minimal ClineMessage shape used elsewhere (ts/text/type/say).
+const makeTaskMessage = (ts: number, text: string): ClineMessage =>
+	({ type: "say", say: "task", ts, text }) as ClineMessage
+
 describe("TaskHeader", () => {
 	const defaultProps: TaskHeaderProps = {
-		task: { type: "say", ts: Date.now(), text: "Test task", images: [] },
 		tokensIn: 100,
 		tokensOut: 50,
 		totalCost: 0.05,
@@ -104,6 +118,15 @@ describe("TaskHeader", () => {
 	const renderTaskHeader = (props: Partial<TaskHeaderProps> = {}) => {
 		return renderWithExtensionState(<TaskHeader {...defaultProps} {...props} />)
 	}
+
+	// Commit 2: TaskHeader reads the task message from the store singleton via
+	// the real useClineMessagesSelector. Every test starts from a clean store
+	// with one task message ("Test task" — the text the existing assertions
+	// expect), matching the previous module-level hook mock.
+	beforeEach(() => {
+		clineMessagesStore.clear()
+		clineMessagesStore.replaceAll([makeTaskMessage(1, "Test task")])
+	})
 
 	it("should display cost when totalCost is greater than 0", () => {
 		renderTaskHeader()
@@ -328,6 +351,44 @@ describe("TaskHeader", () => {
 			renderTaskHeader({ contextTokens: 250 })
 
 			expect(screen.getByText("25%")).toBeInTheDocument()
+		})
+	})
+
+	describe("Commit 2 — task text from the store (selector at(0))", () => {
+		it("renders nothing until the first message arrives in the store", () => {
+			act(() => {
+				clineMessagesStore.clear()
+			})
+			renderTaskHeader()
+			// No task message yet → TaskHeader returns null → no task text rendered.
+			expect(screen.queryByText("Test task")).not.toBeInTheDocument()
+
+			act(() => {
+				clineMessagesStore.replaceAll([makeTaskMessage(7, "Arrived task")])
+			})
+			expect(screen.getByText("Arrived task")).toBeInTheDocument()
+		})
+
+		it("renders the new task's first message after a task switch (remount)", () => {
+			const { unmount } = renderTaskHeader()
+			expect(screen.getByText("Test task")).toBeInTheDocument()
+
+			// Task switch: ChatView is keyed by currentTaskId, so the whole tree
+			// (TaskHeader included) UNMOUNTS, then a fresh mount reads at(0) from
+			// the new task's snapshot.
+			act(() => {
+				clineMessagesStore.clear()
+				clineMessagesStore.replaceAll([makeTaskMessage(99, "New task")])
+			})
+			act(() => {
+				unmount()
+			})
+			act(() => {
+				renderTaskHeader()
+			})
+
+			expect(screen.getByText("New task")).toBeInTheDocument()
+			expect(screen.queryByText("Test task")).not.toBeInTheDocument()
 		})
 	})
 })

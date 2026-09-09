@@ -472,7 +472,7 @@ describe("mergeExtensionState", () => {
 		})
 	})
 
-	describe("clineMessagesSeq protection", () => {
+	describe("streaming slice isolation (Commit 2)", () => {
 		const baseState: ExtensionState = {
 			version: "",
 			mcpEnabled: false,
@@ -511,112 +511,39 @@ describe("mergeExtensionState", () => {
 		const makeMessage = (ts: number, text: string): ClineMessage =>
 			({ ts, type: "say", say: "text", text }) as ClineMessage
 
-		it("rejects stale clineMessages when seq is not newer", () => {
-			const newerMessages = [makeMessage(1, "hello"), makeMessage(2, "world")]
-			const staleMessages = [makeMessage(1, "hello")]
-
+		it("strips the streaming slice so context never re-renders on stream flushes", () => {
 			const prevState: ExtensionState = {
 				...baseState,
-				clineMessages: newerMessages,
+				clineMessages: [makeMessage(1, "old")],
 				clineMessagesSeq: 5,
 			}
 
 			const result = mergeExtensionState(prevState, {
-				clineMessages: staleMessages,
-				clineMessagesSeq: 3, // stale seq
+				clineMessages: [makeMessage(1, "old"), makeMessage(2, "new")],
+				clineMessagesSeq: 6,
+				currentTaskId: "task-1",
 			})
 
-			// Should keep the newer messages
-			expect(result.clineMessages).toBe(newerMessages)
-			expect(result.clineMessagesSeq).toBe(5)
+			// The streaming slice lives in ClineMessagesStore; the context merge
+			// must neither keep nor merge it (the store applies its own seq guard
+			// in replaceAll). Non-streaming fields still merge normally.
+			expect(result).not.toHaveProperty("clineMessages")
+			expect(result).not.toHaveProperty("clineMessagesSeq")
+			expect(result.currentTaskId).toBe("task-1")
 		})
 
-		it("rejects clineMessages when seq equals current (not strictly greater)", () => {
-			const currentMessages = [makeMessage(1, "hello"), makeMessage(2, "world")]
-			const sameSeqMessages = [makeMessage(1, "hello")]
-
+		it("does not keep a stale streaming slice carried over in prevState", () => {
 			const prevState: ExtensionState = {
 				...baseState,
-				clineMessages: currentMessages,
+				clineMessages: [makeMessage(1, "old")],
 				clineMessagesSeq: 5,
 			}
 
-			const result = mergeExtensionState(prevState, {
-				clineMessages: sameSeqMessages,
-				clineMessagesSeq: 5, // same seq, not strictly greater
-			})
+			const result = mergeExtensionState(prevState, { currentTaskId: "task-2" })
 
-			expect(result.clineMessages).toBe(currentMessages)
-			expect(result.clineMessagesSeq).toBe(5)
-		})
-
-		it("accepts clineMessages when seq is strictly greater", () => {
-			const oldMessages = [makeMessage(1, "hello")]
-			const newMessages = [makeMessage(1, "hello"), makeMessage(2, "world")]
-
-			const prevState: ExtensionState = {
-				...baseState,
-				clineMessages: oldMessages,
-				clineMessagesSeq: 3,
-			}
-
-			const result = mergeExtensionState(prevState, {
-				clineMessages: newMessages,
-				clineMessagesSeq: 4, // newer seq
-			})
-
-			expect(result.clineMessages).toBe(newMessages)
-			expect(result.clineMessagesSeq).toBe(4)
-		})
-
-		it("preserves clineMessages when newState does not include them (cloud event path)", () => {
-			const existingMessages = [makeMessage(1, "hello"), makeMessage(2, "world")]
-
-			const prevState: ExtensionState = {
-				...baseState,
-				clineMessages: existingMessages,
-				clineMessagesSeq: 5,
-			}
-
-			// Simulate a cloud event push that omits clineMessages and clineMessagesSeq
-			const result = mergeExtensionState(prevState, {
-				cloudIsAuthenticated: true,
-			})
-
-			expect(result.clineMessages).toBe(existingMessages)
-			expect(result.clineMessagesSeq).toBe(5)
-		})
-
-		it("applies clineMessages normally when neither state has seq (backward compat)", () => {
-			const oldMessages = [makeMessage(1, "hello")]
-			const newMessages = [makeMessage(1, "hello"), makeMessage(2, "world")]
-
-			const prevState: ExtensionState = {
-				...baseState,
-				clineMessages: oldMessages,
-			}
-
-			const result = mergeExtensionState(prevState, {
-				clineMessages: newMessages,
-			})
-
-			expect(result.clineMessages).toBe(newMessages)
-		})
-
-		it("applies clineMessages when prevState has no seq but newState does (first push)", () => {
-			const prevState: ExtensionState = {
-				...baseState,
-				clineMessages: [],
-			}
-
-			const newMessages = [makeMessage(1, "hello")]
-			const result = mergeExtensionState(prevState, {
-				clineMessages: newMessages,
-				clineMessagesSeq: 1,
-			})
-
-			expect(result.clineMessages).toBe(newMessages)
-			expect(result.clineMessagesSeq).toBe(1)
+			expect(result).not.toHaveProperty("clineMessages")
+			expect(result).not.toHaveProperty("clineMessagesSeq")
+			expect(result.currentTaskId).toBe("task-2")
 		})
 	})
 })

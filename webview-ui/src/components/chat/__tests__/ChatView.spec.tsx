@@ -13,6 +13,8 @@ import {
 import { vscode } from "@src/utils/vscode"
 import type { SuggestionItem } from "@roo-code/types"
 
+import { clineMessagesStore } from "@src/context/stores/clineMessagesStore"
+
 import ChatView, { ChatViewProps } from "../ChatView"
 
 const mockVirtuosoState = vi.hoisted(() => ({
@@ -89,20 +91,26 @@ const mockTaskHeaderState = vi.hoisted(() => ({
 	renders: [] as Array<{ taskId?: string; aggregatedCost?: number }>,
 }))
 
-vi.mock("../TaskHeader", () => ({
-	default: function MockTaskHeader({ task, aggregatedCost }: { task: ClineMessage; aggregatedCost?: number }) {
-		mockTaskHeaderState.renders.push({ taskId: task.text, aggregatedCost })
+vi.mock("../TaskHeader", async () => {
+	// Commit 2: the real TaskHeader reads the task message from the streaming
+	// store via useClineMessagesSelector (messages.at(0)) instead of a `task`
+	// prop. The mock mirrors that so `data-task-id` stays driven by store data.
+	// The factory is hoisted above the spec's imports, so the hook module must
+	// be loaded with `await import()` (resolved through the vitest module graph
+	// — `require` cannot load TS modules here).
+	const { useClineMessagesSelector } = await import("../../../hooks/useClineMessages")
 
-		return (
-			<div
-				data-aggregated-cost={aggregatedCost ?? ""}
-				data-task-id={task.text}
-				data-task-ts={task.ts}
-				data-testid="task-header"
-			/>
-		)
-	},
-}))
+	return {
+		default: function MockTaskHeader({ aggregatedCost }: { aggregatedCost?: number }) {
+			const task = useClineMessagesSelector((messages) => messages.at(0))
+			mockTaskHeaderState.renders.push({ taskId: task?.text, aggregatedCost })
+
+			return (
+				<div data-aggregated-cost={aggregatedCost ?? ""} data-task-id={task?.text} data-testid="task-header" />
+			)
+		},
+	}
+})
 
 vi.mock("../AutoApproveMenu", () => ({
 	default: () => null,
@@ -352,10 +360,24 @@ vi.mock("@vscode/webview-ui-toolkit/react", () => ({
 const vscodePostMessageMock = mockVscodePostMessage(vi.mocked(vscode.postMessage))
 
 const mockPostMessage = (state: Record<string, unknown>) => {
+	// Commit 2: the shell mounts the streaming area (MessageStream) only when
+	// `currentTaskId` is set (hasActiveTaskArea). In the real app the extension
+	// always posts currentTaskId once a task exists, so when a test hydrates
+	// messages without one, default it from the presence of a non-empty
+	// clineMessages array. Empty clineMessages keeps the welcome screen intact.
+	const postState = makeExtensionState(state)
+	if (
+		postState.currentTaskId === undefined &&
+		Array.isArray(postState.clineMessages) &&
+		postState.clineMessages.length > 0
+	) {
+		postState.currentTaskId = "test-task-id"
+	}
+
 	window.postMessage(
 		{
 			type: "state",
-			state: makeExtensionState(state),
+			state: postState,
 		},
 		"*",
 	)
@@ -415,6 +437,14 @@ const defaultProps: ChatViewProps = {
 const renderChatView = (props: Partial<ChatViewProps> = {}) => {
 	return renderWithExtensionState(<ChatView {...defaultProps} {...props} />)
 }
+
+// The clineMessagesStore is a module singleton: its snapshot (messages + seq +
+// string cache) survives across tests even though stop() detaches the window
+// listener on unmount. Real MessageStream components subscribe to it in every
+// test, so reset it before each test to prevent cross-test pollution.
+beforeEach(() => {
+	clineMessagesStore.clear()
+})
 
 describe("ChatView - Tool Batching Tests", () => {
 	beforeEach(() => vi.clearAllMocks())
@@ -711,7 +741,9 @@ describe("ChatView - Virtualization Configuration", () => {
 
 		expect(mockVirtuosoState.lastConfig?.defaultItemHeight).toBe(180)
 		expect(mockVirtuosoState.lastConfig?.increaseViewportBy).toEqual({ top: 600, bottom: 800 })
-		expect(mockVirtuosoState.lastConfig?.computeItemKey?.(1, { type: "say", ts: rowTs })).toBe(`${rowTs}-1`)
+		// Commit 2: keys carry a partial/full suffix (REMOUNT POINT #4) so a
+		// partial row is remounted when it is replaced by its final version.
+		expect(mockVirtuosoState.lastConfig?.computeItemKey?.(1, { type: "say", ts: rowTs })).toBe(`${rowTs}-1-full`)
 	})
 })
 
@@ -1079,9 +1111,14 @@ describe("ChatView - Message Queueing Tests", () => {
 			],
 		})
 
-		// Wait for state to be updated
+		// Wait until the api_req_started boundary propagation has committed and
+		// sending is actually disabled. The shell derives sendingDisabled from the
+		// boundary uplink, so asserting on a stable DOM node alone (chat-textarea is
+		// already present) races the send below against a stale handleSendMessage.
 		await waitFor(() => {
-			expect(getByTestId("chat-textarea")).toBeInTheDocument()
+			const chatTextArea = getByTestId("chat-textarea")
+			const input = chatTextArea.querySelector("input")!
+			expect(input.getAttribute("data-sending-disabled")).toBe("true")
 		})
 
 		// Clear message calls before simulating user input
