@@ -862,7 +862,7 @@ describe("ClineProvider", () => {
 		expect(postMessageSpy).not.toHaveBeenCalledWith(expect.objectContaining({ type: "action" }))
 	})
 
-	test("postStateToWebviewWithoutTaskHistory waits for the webview post boundary", async () => {
+	test("postStateToWebview({ includeClineMessages: true }) waits for the webview post boundary", async () => {
 		let releasePost!: () => void
 		const pendingPost = new Promise<void>((resolve) => {
 			releasePost = resolve
@@ -874,7 +874,7 @@ describe("ClineProvider", () => {
 		} as unknown as ExtensionState)
 		const postMessageSpy = vi.spyOn(provider, "postMessageToWebview").mockReturnValue(pendingPost)
 
-		const statePost = provider.postStateToWebviewWithoutTaskHistory()
+		const statePost = provider.postStateToWebview({ includeClineMessages: true })
 		void statePost.then(() => {
 			statePostSettled = true
 		})
@@ -888,13 +888,7 @@ describe("ClineProvider", () => {
 		expect(statePostSettled).toBe(true)
 	})
 
-	test.each([
-		["postStateToWebview", (currentProvider: ClineProvider) => currentProvider.postStateToWebview()],
-		[
-			"postStateToWebviewWithoutTaskHistory",
-			(currentProvider: ClineProvider) => currentProvider.postStateToWebviewWithoutTaskHistory(),
-		],
-	])("%s assigns message sequence numbers before asynchronous state construction", async (_methodName, postState) => {
+	test("postStateToWebview({ includeClineMessages: true }) stamps sequence numbers in post completion order when posts race", async () => {
 		let releaseOlderSnapshot!: (state: ExtensionState) => void
 		const olderSnapshot = new Promise<ExtensionState>((resolve) => {
 			releaseOlderSnapshot = resolve
@@ -912,9 +906,10 @@ describe("ClineProvider", () => {
 			.mockResolvedValueOnce(readyState)
 		const postMessageSpy = vi.spyOn(provider, "postMessageToWebview").mockResolvedValue(undefined)
 
-		const olderPost = postState(provider)
+		const postOptions = { includeClineMessages: true } as const
+		const olderPost = provider.postStateToWebview(postOptions)
 		await Promise.resolve()
-		const newerPost = postState(provider)
+		const newerPost = provider.postStateToWebview(postOptions)
 		await newerPost
 		releaseOlderSnapshot(emptyState)
 		await olderPost
@@ -923,18 +918,33 @@ describe("ClineProvider", () => {
 			readyState.clineMessages,
 			emptyState.clineMessages,
 		])
-		expect(postMessageSpy.mock.calls.map(([message]) => message.state?.clineMessagesSeq)).toEqual([2, 1])
+		// Commit 4: the sequence is stamped after the (async) state snapshot is
+		// built, right before the post is sent, so the post that completes first
+		// gets the lower number — the webview store can still discard
+		// out-of-order deliveries because seq tracks delivery order.
+		expect(postMessageSpy.mock.calls.map(([message]) => message.state?.clineMessagesSeq)).toEqual([1, 2])
+	})
+
+	test("postStateToWebview() without clineMessages does not advance the message sequence", async () => {
+		vi.spyOn(provider, "getStateToPostToWebview").mockResolvedValue({} as unknown as ExtensionState)
+		const postMessageSpy = vi.spyOn(provider, "postMessageToWebview").mockResolvedValue(undefined)
+
+		await provider.postStateToWebview()
+
+		expect(postMessageSpy.mock.calls[0]?.[0].state?.clineMessagesSeq).toBeUndefined()
+
+		// A subsequent include-post must get the FIRST sequence number: the bare
+		// post above should not have consumed one.
+		await provider.postStateToWebview({ includeClineMessages: true })
+		expect(postMessageSpy.mock.calls[1]?.[0].state?.clineMessagesSeq).toBe(1)
 	})
 
 	test.each([
 		[
-			"postStateToWebviewWithoutTaskHistory",
-			(currentProvider: ClineProvider) => currentProvider.postStateToWebviewWithoutTaskHistory(),
+			"postStateToWebview({ includeClineMessages: true })",
+			(currentProvider: ClineProvider) => currentProvider.postStateToWebview({ includeClineMessages: true }),
 		],
-		[
-			"postStateToWebviewWithoutClineMessages",
-			(currentProvider: ClineProvider) => currentProvider.postStateToWebviewWithoutClineMessages(),
-		],
+		["postStateToWebview()", (currentProvider: ClineProvider) => currentProvider.postStateToWebview()],
 	])("%s skips task history computation", async (_methodName, postState) => {
 		const getAllSpy = vi.spyOn(provider.taskHistoryStore, "getAll")
 		const postMessageSpy = vi.spyOn(provider, "postMessageToWebview").mockResolvedValue(undefined)
@@ -943,6 +953,9 @@ describe("ClineProvider", () => {
 
 		expect(getAllSpy).not.toHaveBeenCalled()
 		expect(postMessageSpy).toHaveBeenCalledOnce()
+		// Commit 4: getStateToPostToWebview OMITS the `taskHistory` key entirely on lean
+		// posts (mirroring how the old postStateToWebviewWithout* helpers stripped it),
+		// so the webview never sees the field on unrelated pushes.
 		expect(postMessageSpy.mock.calls[0]?.[0].state).not.toHaveProperty("taskHistory")
 	})
 
@@ -976,145 +989,6 @@ describe("ClineProvider", () => {
 		expect(getAllSpy).toHaveBeenCalledOnce()
 		expect(historyReadPhases).toEqual([true])
 		expect(state.taskHistory).toEqual([historyItem])
-	})
-
-	describe("postStateToWebviewThrottled", () => {
-		beforeEach(() => {
-			vi.useFakeTimers()
-		})
-
-		afterEach(async () => {
-			await provider.dispose()
-			vi.useRealTimers()
-		})
-
-		test("posts on the leading edge and coalesces a burst into one trailing post", async () => {
-			const postStateSpy = vi.spyOn(provider, "postStateToWebviewWithoutTaskHistory").mockResolvedValue(undefined)
-
-			await provider.postStateToWebviewThrottled()
-			await provider.postStateToWebviewThrottled()
-			await provider.postStateToWebviewThrottled()
-
-			expect(postStateSpy).toHaveBeenCalledTimes(1)
-
-			await vi.advanceTimersByTimeAsync(499)
-			expect(postStateSpy).toHaveBeenCalledTimes(1)
-
-			await vi.advanceTimersByTimeAsync(1)
-			expect(postStateSpy).toHaveBeenCalledTimes(2)
-		})
-
-		test("does not starve state posts during continuous updates", async () => {
-			const postStateSpy = vi.spyOn(provider, "postStateToWebviewWithoutTaskHistory").mockResolvedValue(undefined)
-
-			await provider.postStateToWebviewThrottled()
-			await vi.advanceTimersByTimeAsync(400)
-			await provider.postStateToWebviewThrottled()
-			await vi.advanceTimersByTimeAsync(400)
-			await provider.postStateToWebviewThrottled()
-			await vi.advanceTimersByTimeAsync(199)
-
-			expect(postStateSpy).toHaveBeenCalledTimes(1)
-
-			await vi.advanceTimersByTimeAsync(1)
-			expect(postStateSpy).toHaveBeenCalledTimes(2)
-		})
-
-		test("flushes a pending trailing post exactly once and waits for it", async () => {
-			let releasePost!: () => void
-			const pendingPost = new Promise<void>((resolve) => {
-				releasePost = resolve
-			})
-			const postStateSpy = vi
-				.spyOn(provider, "postStateToWebviewWithoutTaskHistory")
-				.mockResolvedValueOnce(undefined)
-				.mockReturnValueOnce(pendingPost)
-
-			await provider.postStateToWebviewThrottled()
-			await provider.postStateToWebviewThrottled()
-			expect(postStateSpy).toHaveBeenCalledTimes(1)
-
-			let flushSettled = false
-			const flushPromise = provider.flushPostStateToWebviewThrottled()
-			void flushPromise.then(() => {
-				flushSettled = true
-			})
-			await Promise.resolve()
-
-			expect(postStateSpy).toHaveBeenCalledTimes(2)
-			expect(flushSettled).toBe(false)
-
-			releasePost()
-			await flushPromise
-			expect(flushSettled).toBe(true)
-
-			await vi.advanceTimersByTimeAsync(1000)
-			expect(postStateSpy).toHaveBeenCalledTimes(2)
-		})
-
-		test("does not duplicate an idle leading post when flushed", async () => {
-			const postStateSpy = vi.spyOn(provider, "postStateToWebviewWithoutTaskHistory").mockResolvedValue(undefined)
-
-			await provider.postStateToWebviewThrottled()
-			await provider.flushPostStateToWebviewThrottled()
-			await vi.advanceTimersByTimeAsync(1000)
-
-			expect(postStateSpy).toHaveBeenCalledOnce()
-		})
-
-		test("handles state post failures inside the debounced callback", async () => {
-			const error = new Error("state post failed")
-			const logSpy = vi.spyOn(provider, "log").mockImplementation(() => {})
-			vi.spyOn(provider, "postStateToWebviewWithoutTaskHistory").mockRejectedValue(error)
-
-			await expect(provider.postStateToWebviewThrottled()).resolves.toBeUndefined()
-			expect(logSpy).toHaveBeenCalledWith(
-				"[ClineProvider#postStateToWebviewThrottled] Failed to post state: state post failed",
-			)
-		})
-
-		test("stringifies non-Error state post failures inside the debounced callback", async () => {
-			const logSpy = vi.spyOn(provider, "log").mockImplementation(() => {})
-			vi.spyOn(provider, "postStateToWebviewWithoutTaskHistory").mockRejectedValue("state post failed")
-
-			await expect(provider.postStateToWebviewThrottled()).resolves.toBeUndefined()
-			expect(logSpy).toHaveBeenCalledWith(
-				"[ClineProvider#postStateToWebviewThrottled] Failed to post state: state post failed",
-			)
-		})
-
-		test("handles state post failures while flushing a pending trailing post", async () => {
-			const error = new Error("state post failed")
-			const logSpy = vi.spyOn(provider, "log").mockImplementation(() => {})
-			const postStateSpy = vi
-				.spyOn(provider, "postStateToWebviewWithoutTaskHistory")
-				.mockResolvedValueOnce(undefined)
-				.mockRejectedValueOnce(error)
-
-			await provider.postStateToWebviewThrottled()
-			await provider.postStateToWebviewThrottled()
-			await expect(provider.flushPostStateToWebviewThrottled()).resolves.toBeUndefined()
-
-			expect(postStateSpy).toHaveBeenCalledTimes(2)
-			expect(logSpy).toHaveBeenCalledWith(
-				"[ClineProvider#postStateToWebviewThrottled] Failed to post state: state post failed",
-			)
-		})
-
-		test("cancels pending work on dispose and ignores later schedule or flush calls", async () => {
-			const postStateSpy = vi.spyOn(provider, "postStateToWebviewWithoutTaskHistory").mockResolvedValue(undefined)
-
-			await provider.postStateToWebviewThrottled()
-			await provider.postStateToWebviewThrottled()
-			expect(postStateSpy).toHaveBeenCalledTimes(1)
-
-			await provider.dispose()
-			await vi.advanceTimersByTimeAsync(1000)
-			await provider.postStateToWebviewThrottled()
-			await provider.flushPostStateToWebviewThrottled()
-
-			expect(postStateSpy).toHaveBeenCalledTimes(1)
-		})
 	})
 
 	test("postMessageToWebview skips postMessage after dispose", async () => {

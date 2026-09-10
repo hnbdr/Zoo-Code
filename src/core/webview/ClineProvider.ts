@@ -7,7 +7,6 @@ import crypto from "crypto"
 import { Anthropic } from "@anthropic-ai/sdk"
 import delay from "delay"
 import axios from "axios"
-import debounce from "lodash.debounce"
 import pWaitFor from "p-wait-for"
 import * as vscode from "vscode"
 
@@ -184,7 +183,19 @@ function scheduleTask(
 
 type GetStateOptions = {
 	includeTaskHistory?: boolean
+	includeClineMessages?: boolean
 }
+
+/**
+ * State shape emitted by postStateToWebview: `clineMessages` and `taskHistory`
+ * are present ONLY when the corresponding include flag is set — mirroring the
+ * old postStateToWebviewWithoutClineMessages, which deleted the keys from the
+ * posted object. Lean posts omit the keys entirely (rather than posting them
+ * with `undefined` values, which structured clone preserves) so the webview's
+ * message/history handlers never fire on unrelated state pushes.
+ */
+type PostableExtensionState = Omit<ExtensionState, "clineMessages" | "taskHistory"> &
+	Partial<Pick<ExtensionState, "clineMessages" | "taskHistory">>
 
 export class ClineProvider
 	extends EventEmitter<TaskProviderEvents>
@@ -223,21 +234,6 @@ export class ClineProvider
 	private taskEventListeners: WeakMap<Task, Array<() => void>> = new WeakMap()
 	private currentWorkspacePath: string | undefined
 	private _disposed = false
-	private readonly _postStateToWebviewThrottled = debounce(
-		async () => {
-			try {
-				await this.postStateToWebviewWithoutTaskHistory()
-			} catch (error) {
-				this.log(
-					`[ClineProvider#postStateToWebviewThrottled] Failed to post state: ${
-						error instanceof Error ? error.message : String(error)
-					}`,
-				)
-			}
-		},
-		500,
-		{ leading: true, trailing: true, maxWait: 1000 },
-	)
 	private readonly rateLimitClock: RateLimitClock = createRateLimitClock()
 
 	private recentTasksCache?: string[]
@@ -368,7 +364,7 @@ export class ClineProvider
 		this.providerSettingsManager = new ProviderSettingsManager(this.context)
 
 		this.customModesManager = new CustomModesManager(this.context, async () => {
-			await this.postStateToWebviewWithoutClineMessages()
+			await this.postStateToWebview()
 		})
 
 		// Initialize MCP Hub through the singleton manager
@@ -841,7 +837,6 @@ export class ClineProvider
 		}
 
 		this._disposed = true
-		this._postStateToWebviewThrottled.cancel()
 		this.log("Disposing ClineProvider...")
 
 		// Reject any tasks still waiting for a scheduler permit so they don't
@@ -2405,7 +2400,7 @@ export class ClineProvider
 				}
 			}
 
-			await this.postStateToWebview()
+			await this.postStateToWebview({ includeTaskHistory: true })
 		} catch (error) {
 			// If task is not found, just remove it from state
 			if (error instanceof Error && error.message === "Task not found") {
@@ -2420,74 +2415,23 @@ export class ClineProvider
 		await this.taskHistoryStore.delete(id)
 		this.recentTasksCache = undefined
 
-		await this.postStateToWebview()
+		await this.postStateToWebview({ includeTaskHistory: true })
 	}
 
 	async refreshWorkspace() {
 		this.currentWorkspacePath = getWorkspacePath()
-		await this.postStateToWebview()
+		await this.postStateToWebview({ includeTaskHistory: true, includeClineMessages: true })
 	}
 
-	async postStateToWebview() {
-		const clineMessagesSeq = ++this.clineMessagesSeq
-		const state = await this.getStateToPostToWebview()
-		state.clineMessagesSeq = clineMessagesSeq
+	async postStateToWebview({ includeClineMessages = false, includeTaskHistory = false } = {}) {
+		const state = await this.getStateToPostToWebview({ includeTaskHistory, includeClineMessages })
+
+		if (includeClineMessages) {
+			this.clineMessagesSeq++
+			state.clineMessagesSeq = this.clineMessagesSeq
+		}
+
 		await this.postMessageToWebview({ type: "state", state })
-	}
-
-	/**
-	 * Like postStateToWebview but intentionally omits taskHistory.
-	 *
-	 * Rationale:
-	 * - taskHistory can be large and was being resent on every chat message update.
-	 * - The webview maintains taskHistory in-memory and receives updates via
-	 *   `taskHistoryUpdated` / `taskHistoryItemUpdated`.
-	 */
-	async postStateToWebviewWithoutTaskHistory(): Promise<void> {
-		const clineMessagesSeq = ++this.clineMessagesSeq
-		const state = await this.getStateToPostToWebview({ includeTaskHistory: false })
-		state.clineMessagesSeq = clineMessagesSeq
-		const { taskHistory: _omit, ...rest } = state
-		await this.postMessageToWebview({ type: "state", state: rest })
-	}
-
-	/**
-	 * Schedules a debounced state-post attempt. A call made while the debounce timer is active returns
-	 * the result of the most recent invocation, so awaiting this method does not wait for the trailing
-	 * invocation scheduled by that call. Use `flushPostStateToWebviewThrottled()` to force and await any
-	 * pending trailing invocation before continuing.
-	 */
-	async postStateToWebviewThrottled(): Promise<void> {
-		if (this._disposed) {
-			return
-		}
-
-		await this._postStateToWebviewThrottled()
-	}
-
-	async flushPostStateToWebviewThrottled(): Promise<void> {
-		if (this._disposed) {
-			return
-		}
-
-		await this._postStateToWebviewThrottled.flush()
-	}
-
-	/**
-	 * Like postStateToWebview but intentionally omits both clineMessages and taskHistory.
-	 *
-	 * Rationale:
-	 * - Cloud event handlers (auth, settings, user-info) and mode changes trigger state pushes
-	 *   that have nothing to do with chat messages. Including clineMessages in these pushes
-	 *   creates race conditions where a stale snapshot of clineMessages (captured during async
-	 *   getStateToPostToWebview) overwrites newer messages the task has streamed in the meantime.
-	 * - This method ensures cloud/mode events only push the state fields they actually affect
-	 *   (cloud auth, org settings, profiles, etc.) without interfering with task message streaming.
-	 */
-	async postStateToWebviewWithoutClineMessages(): Promise<void> {
-		const state = await this.getStateToPostToWebview({ includeTaskHistory: false })
-		const { clineMessages: _omitMessages, taskHistory: _omitHistory, ...rest } = state
-		await this.postMessageToWebview({ type: "state", state: rest })
 	}
 
 	/**
@@ -2591,7 +2535,10 @@ export class ClineProvider
 		}
 	}
 
-	async getStateToPostToWebview({ includeTaskHistory = true }: GetStateOptions = {}): Promise<ExtensionState> {
+	async getStateToPostToWebview({
+		includeTaskHistory = true,
+		includeClineMessages = true,
+	}: GetStateOptions = {}): Promise<PostableExtensionState> {
 		// Ensure the store is initialized before reading task history
 		await this.taskHistoryStore.initialized
 
@@ -2778,12 +2725,14 @@ export class ClineProvider
 			uriScheme: vscode.env.uriScheme,
 			currentTaskId: currentTask?.taskId,
 			currentTaskItem: currentTask?.taskId ? this.taskHistoryStore.get(currentTask.taskId) : undefined,
-			clineMessages: currentTask?.clineMessages || [],
+			// Commit 4: omitted (not undefined) when the flag is off — see
+			// PostableExtensionState for why key-absence matters to the webview.
+			...(includeClineMessages ? { clineMessages: currentTask?.clineMessages || [] } : {}),
 			currentTaskTodos: currentTask?.todoList || [],
 			messageQueue: currentTask?.messageQueueService?.messages,
-			taskHistory: includeTaskHistory
-				? this.taskHistoryStore.getAll().filter((item: HistoryItem) => item.ts && item.task)
-				: [],
+			...(includeTaskHistory
+				? { taskHistory: this.taskHistoryStore.getAll().filter((item: HistoryItem) => item.ts && item.task) }
+				: {}),
 			soundEnabled: soundEnabled ?? false,
 			ttsEnabled: ttsEnabled ?? false,
 			ttsSpeed: ttsSpeed ?? 1.0,
@@ -3252,7 +3201,7 @@ export class ClineProvider
 		await this.providerSettingsManager.resetAllConfigs()
 		await this.customModesManager.resetCustomModes()
 		await this.removeClineFromStack()
-		await this.postStateToWebview()
+		await this.postStateToWebview({ includeTaskHistory: true, includeClineMessages: true })
 		await this.postMessageToWebview({ type: "action", action: "chatButtonClicked" })
 	}
 

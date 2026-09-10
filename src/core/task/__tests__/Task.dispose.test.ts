@@ -50,7 +50,6 @@ describe("Task dispose method", () => {
 		context: { globalStorageUri: { fsPath: string } }
 		getState: ReturnType<typeof vi.fn>
 		log: ReturnType<typeof vi.fn>
-		flushPostStateToWebviewThrottled: ReturnType<typeof vi.fn>
 	}
 	let mockApiConfiguration: ProviderSettings
 	let task: Task
@@ -68,7 +67,6 @@ describe("Task dispose method", () => {
 			},
 			getState: vi.fn().mockResolvedValue({ mode: "code" }),
 			log: vi.fn(),
-			flushPostStateToWebviewThrottled: vi.fn().mockResolvedValue(undefined),
 		}
 
 		// Mock API configuration

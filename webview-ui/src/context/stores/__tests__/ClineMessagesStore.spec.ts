@@ -259,6 +259,42 @@ describe("ClineMessagesStore", () => {
 			expect(store.getCacheSize()).toBeGreaterThan(0)
 		})
 
+		it("clears when currentTaskId changes even if the post omits clineMessages (Commit 4 lean posts)", () => {
+			// Commit 4 made the queue-handler state post lean (no clineMessages).
+			// A lean post is legal mid-task (same currentTaskId → no clear, see the
+			// next test), but if it DOES carry a new currentTaskId the old task's
+			// messages must still be dropped: its ChatView is unmounted (keyed by
+			// currentTaskId) and the new task hydrates via its own full state post
+			// that follows the switch. Holding on to task-a's rows under task-b's
+			// header would be worse than a transient empty state.
+			store.start()
+			dispatchWindowMessage({
+				type: "state",
+				state: { currentTaskId: "task-a", clineMessages: [makeMessage(1, "a")], clineMessagesSeq: 1 },
+			})
+			dispatchWindowMessage({ type: "messageUpdated", clineMessage: makeMessage(2, "b") })
+
+			// Task switch with NO clineMessages in the payload (bare state post).
+			dispatchWindowMessage({
+				type: "state",
+				state: { currentTaskId: "task-b" },
+			})
+
+			const snapshot = store.getSnapshot()
+			expect(snapshot).toEqual([])
+			expect(store.getSeq()).toBeUndefined()
+			// Interned strings of task-a were released by the clear.
+			expect(store.getCacheSize()).toBe(0)
+
+			// The new task's own hydration then re-populates the store.
+			const hydration = [makeMessage(10, "task-b msg")]
+			dispatchWindowMessage({
+				type: "state",
+				state: { currentTaskId: "task-b", clineMessages: hydration, clineMessagesSeq: 1 },
+			})
+			expect(store.getSnapshot()).toBe(hydration)
+		})
+
 		it("does not clear when a same-task state post omits clineMessages (cloud event path)", () => {
 			store.start()
 			dispatchWindowMessage({

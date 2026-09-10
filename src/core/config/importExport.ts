@@ -36,7 +36,10 @@ type ExportOptions = {
 type ImportWithProviderOptions = ImportOptions & {
 	provider: {
 		settingsImportedAt?: number
-		postStateToWebview: () => Promise<void>
+		postStateToWebview: (options?: {
+			includeTaskHistory?: boolean
+			includeClineMessages?: boolean
+		}) => Promise<void>
 	}
 }
 
@@ -385,7 +388,7 @@ export const importSettingsWithFeedback = async (
 
 	if (result.success) {
 		provider.settingsImportedAt = Date.now()
-		await provider.postStateToWebview()
+		await provider.postStateToWebview({ includeClineMessages: true, includeTaskHistory: true })
 		provider.settingsImportedAt = undefined
 		const warnings = "warnings" in result ? result.warnings : undefined
 

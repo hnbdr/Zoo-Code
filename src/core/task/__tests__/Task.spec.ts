@@ -406,9 +406,6 @@ describe("Cline", () => {
 		// Mock provider methods
 		mockProvider.postMessageToWebview = vi.fn().mockResolvedValue(undefined)
 		mockProvider.postStateToWebview = vi.fn().mockResolvedValue(undefined)
-		mockProvider.postStateToWebviewWithoutTaskHistory = vi.fn().mockResolvedValue(undefined)
-		mockProvider.postStateToWebviewThrottled = vi.fn().mockResolvedValue(undefined)
-		mockProvider.flushPostStateToWebviewThrottled = vi.fn().mockResolvedValue(undefined)
 		mockProvider.getTaskWithId = vi.fn().mockImplementation(async (id) => ({
 			historyItem: {
 				id,
@@ -1939,9 +1936,6 @@ describe("Cline", () => {
 					getSkillsManager: vi.fn().mockReturnValue(undefined),
 					say: vi.fn(),
 					postStateToWebview: vi.fn().mockResolvedValue(undefined),
-					postStateToWebviewWithoutTaskHistory: vi.fn().mockResolvedValue(undefined),
-					postStateToWebviewThrottled: vi.fn().mockResolvedValue(undefined),
-					flushPostStateToWebviewThrottled: vi.fn().mockResolvedValue(undefined),
 					postMessageToWebview: vi.fn().mockResolvedValue(undefined),
 					updateTaskHistory: vi.fn().mockResolvedValue(undefined),
 					// Task receives a full ClineProvider at runtime; this focused unit test only exercises these methods.
@@ -2631,30 +2625,44 @@ describe("Cline", () => {
 	})
 
 	describe("webview state throttling", () => {
-		it("schedules a complete new message without forcing an immediate state push", async () => {
-			const task = new Task({
-				provider: mockProvider,
-				apiConfiguration: mockApiConfig,
-				task: "test task",
-				startTask: false,
-			})
-			vi.spyOn(getTaskTestAccess(task), "saveClineMessages").mockResolvedValue(true)
-			const message = {
-				ts: Date.now(),
-				type: "say" as const,
-				say: "text" as const,
-				text: "message",
+		it("delivers a complete new message via a debounced messageUpdated post (no state push)", async () => {
+			vi.useFakeTimers()
+			try {
+				const task = new Task({
+					provider: mockProvider,
+					apiConfiguration: mockApiConfig,
+					task: "test task",
+					startTask: false,
+				})
+				const taskAccess = getTaskTestAccess(task)
+				vi.spyOn(taskAccess, "saveClineMessages").mockResolvedValue(true)
+				const updatePostSpy = vi.mocked(mockProvider.postMessageToWebview)
+				const message = {
+					ts: Date.now(),
+					type: "say" as const,
+					say: "text" as const,
+					text: "message",
+				}
+
+				await taskAccess.addToClineMessages(message)
+
+				// A complete (non-partial, non-ask) message rides the debounce window.
+				expect(updatePostSpy).not.toHaveBeenCalled()
+				expect(mockProvider.postStateToWebview).not.toHaveBeenCalled()
+
+				vi.advanceTimersByTime(MESSAGE_UPDATE_DEBOUNCE_MS)
+
+				expect(updatePostSpy).toHaveBeenCalledTimes(1)
+				expect(updatePostSpy).toHaveBeenCalledWith({
+					type: "messageUpdated",
+					clineMessage: message,
+				})
+			} finally {
+				vi.useRealTimers()
 			}
-
-			await getTaskTestAccess(task).addToClineMessages(message)
-
-			expect(mockProvider.postStateToWebviewThrottled).toHaveBeenCalledOnce()
-			expect(mockProvider.postStateToWebviewThrottled).toHaveBeenCalledWith()
-			expect(mockProvider.flushPostStateToWebviewThrottled).not.toHaveBeenCalled()
-			expect(mockProvider.postStateToWebviewWithoutTaskHistory).not.toHaveBeenCalled()
 		})
 
-		it("waits for an unanswered ask flush before emitting the message", async () => {
+		it("flushes an unanswered ask synchronously before emitting the created message", async () => {
 			const task = new Task({
 				provider: mockProvider,
 				apiConfiguration: mockApiConfig,
@@ -2663,11 +2671,7 @@ describe("Cline", () => {
 			})
 			const taskAccess = getTaskTestAccess(task)
 			vi.spyOn(taskAccess, "saveClineMessages").mockResolvedValue(true)
-			let releaseFlush!: () => void
-			const pendingFlush = new Promise<void>((resolve) => {
-				releaseFlush = resolve
-			})
-			const flushSpy = vi.mocked(mockProvider.flushPostStateToWebviewThrottled).mockReturnValueOnce(pendingFlush)
+			const updatePostSpy = vi.mocked(mockProvider.postMessageToWebview)
 			const messageListener = vi.fn()
 			task.on(RooCodeEventName.Message, messageListener)
 			const message = {
@@ -2676,23 +2680,20 @@ describe("Cline", () => {
 				ask: "resume_task" as const,
 			}
 
-			const addPromise = taskAccess.addToClineMessages(message)
+			await taskAccess.addToClineMessages(message)
 
-			await Promise.resolve()
-			expect(mockProvider.postStateToWebviewThrottled).toHaveBeenCalledOnce()
-			expect(mockProvider.postStateToWebviewThrottled).toHaveBeenCalledWith()
-			expect(flushSpy).toHaveBeenCalledOnce()
-			expect(flushSpy).toHaveBeenCalledWith()
-			expect(messageListener).not.toHaveBeenCalled()
-
-			releaseFlush()
-			await addPromise
-
-			expect(flushSpy.mock.invocationCallOrder[0]).toBeLessThan(messageListener.mock.invocationCallOrder[0])
+			// flushNow() is synchronous: the messageUpdated post lands before the
+			// "created" emission so webview listeners can respond to the ask.
+			expect(updatePostSpy).toHaveBeenCalledOnce()
+			expect(updatePostSpy).toHaveBeenCalledWith({
+				type: "messageUpdated",
+				clineMessage: message,
+			})
+			expect(updatePostSpy.mock.invocationCallOrder[0]).toBeLessThan(messageListener.mock.invocationCallOrder[0])
 			expect(messageListener).toHaveBeenCalledWith({ action: "created", message })
 		})
 
-		it("continues the message lifecycle when throttled state scheduling and flushing fail", async () => {
+		it("continues the message lifecycle when the messageUpdated post fails", async () => {
 			const task = new Task({
 				provider: mockProvider,
 				apiConfiguration: mockApiConfig,
@@ -2700,10 +2701,8 @@ describe("Cline", () => {
 				startTask: false,
 			})
 			const taskAccess = getTaskTestAccess(task)
-			const postError = new Error("state schedule failed")
-			const flushError = new Error("state flush failed")
-			const postSpy = vi.mocked(mockProvider.postStateToWebviewThrottled).mockRejectedValueOnce(postError)
-			const flushSpy = vi.mocked(mockProvider.flushPostStateToWebviewThrottled).mockRejectedValueOnce(flushError)
+			const postError = new Error("messageUpdated post failed")
+			const postSpy = vi.mocked(mockProvider.postMessageToWebview).mockRejectedValueOnce(postError)
 			const saveSpy = vi.spyOn(taskAccess, "saveClineMessages").mockResolvedValue(true)
 			const messageListener = vi.fn()
 			const consoleErrorSpy = vi.spyOn(console, "error").mockImplementation(() => {})
@@ -2717,46 +2716,54 @@ describe("Cline", () => {
 			await expect(taskAccess.addToClineMessages(message)).resolves.toBeUndefined()
 
 			expect(consoleErrorSpy).toHaveBeenCalledWith(
-				"[Task#addToClineMessages] postStateToWebviewThrottled failed:",
+				"[Task#messageUpdateDebouncer] postMessageToWebview failed:",
 				postError,
 			)
-			expect(consoleErrorSpy).toHaveBeenCalledWith(
-				"[Task#addToClineMessages] flushPostStateToWebviewThrottled failed:",
-				flushError,
-			)
 			expect(postSpy).toHaveBeenCalledOnce()
-			expect(flushSpy).toHaveBeenCalledOnce()
 			expect(messageListener).toHaveBeenCalledWith({ action: "created", message })
 			expect(saveSpy).toHaveBeenCalledOnce()
-			expect(postSpy.mock.invocationCallOrder[0]).toBeLessThan(flushSpy.mock.invocationCallOrder[0])
-			expect(flushSpy.mock.invocationCallOrder[0]).toBeLessThan(messageListener.mock.invocationCallOrder[0])
-			expect(messageListener.mock.invocationCallOrder[0]).toBeLessThan(saveSpy.mock.invocationCallOrder[0])
 
 			consoleErrorSpy.mockRestore()
 		})
 
-		it("keeps an already answered ask on the throttled path", async () => {
-			const task = new Task({
-				provider: mockProvider,
-				apiConfiguration: mockApiConfig,
-				task: "test task",
-				startTask: false,
-			})
-			vi.spyOn(getTaskTestAccess(task), "saveClineMessages").mockResolvedValue(true)
+		it("keeps an already answered ask on the debounced path", async () => {
+			vi.useFakeTimers()
+			try {
+				const task = new Task({
+					provider: mockProvider,
+					apiConfiguration: mockApiConfig,
+					task: "test task",
+					startTask: false,
+				})
+				const taskAccess = getTaskTestAccess(task)
+				vi.spyOn(taskAccess, "saveClineMessages").mockResolvedValue(true)
+				const updatePostSpy = vi.mocked(mockProvider.postMessageToWebview)
+				const message = {
+					ts: 1,
+					type: "ask" as const,
+					ask: "tool" as const,
+					isAnswered: true,
+				}
 
-			await getTaskTestAccess(task).addToClineMessages({
-				ts: 1,
-				type: "ask",
-				ask: "tool",
-				isAnswered: true,
-			})
+				await taskAccess.addToClineMessages(message)
 
-			expect(mockProvider.postStateToWebviewThrottled).toHaveBeenCalledOnce()
-			expect(mockProvider.postStateToWebviewThrottled).toHaveBeenCalledWith()
-			expect(mockProvider.flushPostStateToWebviewThrottled).not.toHaveBeenCalled()
+				// An already answered ask does not need to reach the webview
+				// immediately — it rides the normal debounce window.
+				expect(updatePostSpy).not.toHaveBeenCalled()
+
+				vi.advanceTimersByTime(MESSAGE_UPDATE_DEBOUNCE_MS)
+
+				expect(updatePostSpy).toHaveBeenCalledTimes(1)
+				expect(updatePostSpy).toHaveBeenCalledWith({
+					type: "messageUpdated",
+					clineMessage: message,
+				})
+			} finally {
+				vi.useRealTimers()
+			}
 		})
 
-		it("debounces per-token partial updates into a single messageUpdated post per window", async () => {
+		it("flushes the created partial immediately and debounces per-token partial updates into one post per window", async () => {
 			vi.useFakeTimers()
 			try {
 				const task = new Task({
@@ -2776,18 +2783,26 @@ describe("Cline", () => {
 					partial: true,
 				}
 				await taskAccess.addToClineMessages(partialMessage)
+
+				// The first partial of a stream is the visible start of the message
+				// — it is flushed synchronously by addToClineMessages.
+				expect(updatePostSpy).toHaveBeenCalledTimes(1)
+				expect(updatePostSpy).toHaveBeenCalledWith({
+					type: "messageUpdated",
+					clineMessage: partialMessage,
+				})
+
+				// Per-token partial updates ride the debounce window and coalesce
+				// into a single messageUpdated post carrying the latest state.
 				await taskAccess.updateClineMessage({ ...partialMessage, text: "updated partial" })
 				await taskAccess.updateClineMessage({ ...partialMessage, text: "updated partial 2" })
 				await taskAccess.updateClineMessage({ ...partialMessage, text: "updated partial 3" })
+				expect(updatePostSpy).toHaveBeenCalledTimes(1)
 
-				// None of the 3 partial updates posted yet — they are debounced.
-				expect(updatePostSpy).not.toHaveBeenCalled()
-
-				// After the default flush window the single post carries the latest state.
 				vi.advanceTimersByTime(MESSAGE_UPDATE_DEBOUNCE_MS)
 
-				expect(updatePostSpy).toHaveBeenCalledTimes(1)
-				expect(updatePostSpy).toHaveBeenCalledWith({
+				expect(updatePostSpy).toHaveBeenCalledTimes(2)
+				expect(updatePostSpy).toHaveBeenLastCalledWith({
 					type: "messageUpdated",
 					clineMessage: {
 						...partialMessage,
@@ -2799,7 +2814,7 @@ describe("Cline", () => {
 			}
 		})
 
-		it("waits for a new partial message flush before a following message update", async () => {
+		it("flushes the created partial before a following debounced message update", async () => {
 			vi.useFakeTimers()
 			try {
 				const task = new Task({
@@ -2810,13 +2825,6 @@ describe("Cline", () => {
 				})
 				const taskAccess = getTaskTestAccess(task)
 				vi.spyOn(taskAccess, "saveClineMessages").mockResolvedValue(true)
-				let releaseFlush!: () => void
-				const pendingFlush = new Promise<void>((resolve) => {
-					releaseFlush = resolve
-				})
-				const flushSpy = vi
-					.mocked(mockProvider.flushPostStateToWebviewThrottled)
-					.mockReturnValueOnce(pendingFlush)
 				const updatePostSpy = vi.mocked(mockProvider.postMessageToWebview)
 				const partialMessage = {
 					ts: 1,
@@ -2825,27 +2833,23 @@ describe("Cline", () => {
 					text: "partial message",
 					partial: true,
 				}
-				let partialAddSettled = false
-				const addThenUpdate = taskAccess.addToClineMessages(partialMessage).then(async () => {
-					partialAddSettled = true
-					await taskAccess.updateClineMessage({ ...partialMessage, text: "updated partial" })
+
+				const addPromise = taskAccess.addToClineMessages(partialMessage)
+				await taskAccess.updateClineMessage({ ...partialMessage, text: "updated partial" })
+				await addPromise
+
+				// The created partial was flushed synchronously; the update is
+				// still debounced, so only the created post has landed.
+				expect(updatePostSpy).toHaveBeenCalledTimes(1)
+				expect(updatePostSpy).toHaveBeenCalledWith({
+					type: "messageUpdated",
+					clineMessage: partialMessage,
 				})
 
-				await Promise.resolve()
-				expect(mockProvider.postStateToWebviewThrottled).toHaveBeenCalledWith()
-				expect(flushSpy).toHaveBeenCalledWith()
-				expect(partialAddSettled).toBe(false)
-				expect(updatePostSpy).not.toHaveBeenCalled()
-
-				releaseFlush()
-				await addThenUpdate
-
-				// The partial update is debounced — advance the debounce window so the
-				// messageUpdated post is observable after the state flush completed.
 				vi.advanceTimersByTime(MESSAGE_UPDATE_DEBOUNCE_MS)
 
-				expect(flushSpy.mock.invocationCallOrder[0]).toBeLessThan(updatePostSpy.mock.invocationCallOrder[0])
-				expect(updatePostSpy).toHaveBeenCalledWith({
+				expect(updatePostSpy).toHaveBeenCalledTimes(2)
+				expect(updatePostSpy).toHaveBeenLastCalledWith({
 					type: "messageUpdated",
 					clineMessage: {
 						...partialMessage,
@@ -2955,23 +2959,51 @@ describe("Cline", () => {
 				task: "test task",
 				startTask: false,
 			})
-			let queuedMessagesAtFlush = -1
-			const flushSpy = vi.mocked(mockProvider.flushPostStateToWebviewThrottled).mockImplementation(async () => {
-				queuedMessagesAtFlush = task.messageQueueService.messages.length
+			let queuedMessagesAtPost = -1
+			let postCount = 0
+			let releasePost!: () => void
+			const pendingPost = new Promise<void>((resolve) => {
+				releasePost = resolve
+			})
+			const postSpy = vi.mocked(mockProvider.postStateToWebview).mockImplementation(async () => {
+				queuedMessagesAtPost = task.messageQueueService.messages.length
+				// Call #1 is the queue handler's own bare post (fired by
+				// addMessage below); call #2 is abortTaskOnce's direct post — only
+				// that one blocks so the test can observe the pending boundary.
+				if (++postCount > 1) {
+					await pendingPost
+				}
 			})
 			const emitSpy = vi.spyOn(task, "emit")
 			const disposeSpy = vi.spyOn(task, "dispose").mockResolvedValue(undefined)
 
 			task.messageQueueService.addMessage("queued text")
-			await task.abortTask()
+
+			let abortSettled = false
+			const abortPromise = task.abortTask().then(() => {
+				abortSettled = true
+			})
+
+			// abortTask awaits its direct post: while it is pending, the queue is
+			// still intact and neither TaskAborted nor disposal has happened yet.
+			// Two posts have started by now: the queue handler's bare post (call #1)
+			// and abortTaskOnce's direct post (call #2, still blocked).
+			await vi.waitFor(() => expect(postSpy).toHaveBeenCalledTimes(2))
+			expect(queuedMessagesAtPost).toBe(1)
+			expect(abortSettled).toBe(false)
+			expect((emitSpy.mock.calls as unknown[][]).some(([event]) => event === RooCodeEventName.TaskAborted)).toBe(
+				false,
+			)
+			expect(disposeSpy).not.toHaveBeenCalled()
+
+			releasePost()
+			await abortPromise
 
 			const taskAbortedCallIndex = (emitSpy.mock.calls as unknown[][]).findIndex(
 				([event]) => event === RooCodeEventName.TaskAborted,
 			)
 			expect(taskAbortedCallIndex).toBeGreaterThanOrEqual(0)
-			expect(queuedMessagesAtFlush).toBe(1)
-			expect(flushSpy).toHaveBeenCalledWith()
-			expect(flushSpy.mock.invocationCallOrder[0]).toBeLessThan(
+			expect(postSpy.mock.invocationCallOrder[1]).toBeLessThan(
 				emitSpy.mock.invocationCallOrder[taskAbortedCallIndex],
 			)
 			expect(emitSpy.mock.invocationCallOrder[taskAbortedCallIndex]).toBeLessThan(
@@ -2979,15 +3011,15 @@ describe("Cline", () => {
 			)
 		})
 
-		it("continues abort cleanup when flushing pending state fails", async () => {
+		it("continues abort cleanup when the final state post fails", async () => {
 			const task = new Task({
 				provider: mockProvider,
 				apiConfiguration: mockApiConfig,
 				task: "test task",
 				startTask: false,
 			})
-			const error = new Error("state flush failed")
-			const flushSpy = vi.mocked(mockProvider.flushPostStateToWebviewThrottled).mockRejectedValueOnce(error)
+			const error = new Error("state post failed")
+			const postSpy = vi.mocked(mockProvider.postStateToWebview).mockRejectedValueOnce(error)
 			const taskAbortedListener = vi.fn()
 			const disposeSpy = vi.spyOn(task, "dispose").mockResolvedValue(undefined)
 			const saveSpy = vi.spyOn(getTaskTestAccess(task), "saveClineMessages").mockResolvedValue(true)
@@ -2997,15 +3029,15 @@ describe("Cline", () => {
 			await expect(task.abortTask()).resolves.toBeUndefined()
 
 			expect(consoleErrorSpy).toHaveBeenCalledWith(
-				`[Task#abortTask] flushPostStateToWebviewThrottled failed for ${task.taskId}.${task.instanceId}:`,
+				`[Task#abortTask] postStateToWebview failed for ${task.taskId}.${task.instanceId}:`,
 				error,
 			)
 			expect(task.abort).toBe(true)
-			expect(flushSpy).toHaveBeenCalledOnce()
+			expect(postSpy).toHaveBeenCalledOnce()
 			expect(taskAbortedListener).toHaveBeenCalledOnce()
 			expect(disposeSpy).toHaveBeenCalledOnce()
 			expect(saveSpy).toHaveBeenCalledOnce()
-			expect(flushSpy.mock.invocationCallOrder[0]).toBeLessThan(taskAbortedListener.mock.invocationCallOrder[0])
+			expect(postSpy.mock.invocationCallOrder[0]).toBeLessThan(taskAbortedListener.mock.invocationCallOrder[0])
 			expect(taskAbortedListener.mock.invocationCallOrder[0]).toBeLessThan(disposeSpy.mock.invocationCallOrder[0])
 
 			consoleErrorSpy.mockRestore()
@@ -5317,12 +5349,10 @@ describe("Cline", () => {
 			const pendingPostState = new Promise<void>((resolve) => {
 				resolvePostState = resolve
 			})
-			const postStateSpy = vi
-				.mocked(mockProvider.postStateToWebviewWithoutTaskHistory)
-				.mockImplementationOnce(async () => {
-					expect(task.clineMessages).toEqual([])
-					await pendingPostState
-				})
+			const postStateSpy = vi.mocked(mockProvider.postStateToWebview).mockImplementationOnce(async () => {
+				expect(task.clineMessages).toEqual([])
+				await pendingPostState
+			})
 			const saySpy = vi.spyOn(task, "say").mockResolvedValue(undefined)
 			vi.spyOn(taskAccess, "getEnabledMcpToolsCount").mockResolvedValue({
 				enabledToolCount: 0,
@@ -5333,7 +5363,6 @@ describe("Cline", () => {
 			const startPromise = taskAccess.startTask("new task")
 
 			expect(postStateSpy).toHaveBeenCalledTimes(1)
-			expect(mockProvider.postStateToWebviewThrottled).not.toHaveBeenCalled()
 			expect(saySpy).not.toHaveBeenCalled()
 
 			resolvePostState?.()
@@ -5342,6 +5371,57 @@ describe("Cline", () => {
 			expect(saySpy).toHaveBeenCalledOnce()
 			expect(saySpy).toHaveBeenCalledWith("text", "new task", undefined)
 			expect(initiateTaskLoopSpy).toHaveBeenCalledOnce()
+		})
+	})
+
+	describe("resumeTaskFromHistory", () => {
+		it("hydrates the saved cline messages via a full state post before asking to resume", async () => {
+			const task = new Task({
+				provider: mockProvider,
+				apiConfiguration: mockApiConfig,
+				historyItem: {
+					id: "123",
+					number: 0,
+					ts: Date.now(),
+					task: "historical task",
+					tokensIn: 100,
+					tokensOut: 200,
+					cacheWrites: 0,
+					cacheReads: 0,
+					totalCost: 0.001,
+				},
+				startTask: false,
+			})
+			const taskAccess = getTaskTestAccess(task)
+			// Avoid real persistence/loop machinery — the point of this test is the
+			// hydration post ordering, not the storage round trip or the API loop.
+			vi.spyOn(taskAccess, "saveClineMessages").mockResolvedValue(true)
+			const askSpy = vi.spyOn(task, "ask").mockResolvedValue({
+				response: "noButtonClicked",
+			} satisfies TaskAskResult)
+			vi.spyOn(taskAccess, "initiateTaskLoop").mockResolvedValue(undefined)
+
+			const postStateSpy = vi.mocked(mockProvider.postStateToWebview).mockImplementationOnce(async () => {
+				// The full saved history must be on the task when the hydration
+				// post fires (regression: after Commit 4 this path no longer got
+				// an implicit full-state post from ask() → addToClineMessages()).
+				// Hydration runs ensureMessageIdentifiers, so legacy messages
+				// saved without IDs gain deterministic `legacy:<ts>:<ordinal>` ids.
+				expect(task.clineMessages).toEqual(
+					mockMessages.map((message, index) => ({ ...message, messageId: `legacy:${message.ts}:${index}` })),
+				)
+			})
+
+			await taskAccess.resumeTaskFromHistory()
+
+			expect(postStateSpy).toHaveBeenCalledTimes(1)
+			// The hydration post must carry clineMessages (messages + seq) but no
+			// taskHistory — startTask() uses the same shape for new tasks.
+			expect(postStateSpy).toHaveBeenCalledWith({ includeClineMessages: true })
+			// The resume question is delivered over the point channel only after the
+			// store has been hydrated with the saved history.
+			expect(askSpy).toHaveBeenCalledOnce()
+			expect(postStateSpy.mock.invocationCallOrder[0]).toBeLessThan(askSpy.mock.invocationCallOrder[0])
 		})
 	})
 
@@ -5463,9 +5543,9 @@ describe("Cline", () => {
 			resumeSpy.mockRestore()
 		})
 
-		it("logs (instead of crashing) when postStateToWebviewThrottled rejects from the queue handler", async () => {
+		it("logs (instead of crashing) when the queue handler's state post rejects", async () => {
 			const boom = new Error("postState boom")
-			mockProvider.postStateToWebviewThrottled = vi.fn().mockRejectedValue(boom)
+			vi.mocked(mockProvider.postStateToWebview).mockRejectedValueOnce(boom)
 
 			const task = new Task({
 				provider: mockProvider,
@@ -5474,14 +5554,15 @@ describe("Cline", () => {
 				startTask: false,
 			})
 
-			// Triggers messageQueueStateChangedHandler -> void postStateToWebviewThrottled()
+			// Triggers messageQueueStateChangedHandler -> void postStateToWebview()
 			task.messageQueueService.addMessage("queued text")
 			await flushMicrotasks()
 
-			expect(mockProvider.postStateToWebviewThrottled).toHaveBeenCalledWith()
-			expect(mockProvider.postStateToWebviewWithoutTaskHistory).not.toHaveBeenCalled()
+			// The queue handler posts the bare (non-message) state: never carries
+			// clineMessages (delivered via messageUpdated) nor taskHistory.
+			expect(mockProvider.postStateToWebview).toHaveBeenCalledWith()
 			expect(consoleErrorSpy).toHaveBeenCalledWith(
-				"[Task#messageQueueStateChangedHandler] postStateToWebviewThrottled failed:",
+				"[Task#messageQueueStateChangedHandler] postStateToWebview failed:",
 				boom,
 			)
 		})
@@ -5812,7 +5893,6 @@ describe("Queued message processing after condense", () => {
 		)
 		provider.postMessageToWebview = vi.fn().mockResolvedValue(undefined)
 		provider.postStateToWebview = vi.fn().mockResolvedValue(undefined)
-		provider.postStateToWebviewWithoutTaskHistory = vi.fn().mockResolvedValue(undefined)
 		provider.getState = vi.fn().mockResolvedValue({})
 		return provider
 	}
@@ -6204,7 +6284,6 @@ describe("pushToolResultToUserContent", () => {
 
 		mockProvider.postMessageToWebview = vi.fn().mockResolvedValue(undefined)
 		mockProvider.postStateToWebview = vi.fn().mockResolvedValue(undefined)
-		mockProvider.postStateToWebviewWithoutTaskHistory = vi.fn().mockResolvedValue(undefined)
 	})
 
 	it("should add tool_result when not a duplicate", () => {

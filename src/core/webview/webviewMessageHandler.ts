@@ -369,8 +369,9 @@ export const webviewMessageHandler = async (
 					globalStoragePath: provider.contextProxy.globalStorageUri.fsPath,
 				})
 
-				// Update the UI to reflect the deletion
-				await provider.postStateToWebview()
+				// Full re-post after rewind: cost/history numbers on the webview have no
+				// dedicated update channel in this flow, so rehydrate messages and history.
+				await provider.postStateToWebview({ includeClineMessages: true, includeTaskHistory: true })
 			}
 		} catch (error) {
 			console.error("Error in delete message:", error)
@@ -539,8 +540,9 @@ export const webviewMessageHandler = async (
 				globalStoragePath: provider.contextProxy.globalStorageUri.fsPath,
 			})
 
-			// Update the UI to reflect the deletion
-			await provider.postStateToWebview()
+			// Full re-post after rewind: cost/history numbers on the webview have no
+			// dedicated update channel in this flow, so rehydrate messages and history.
+			await provider.postStateToWebview({ includeClineMessages: true, includeTaskHistory: true })
 
 			await currentCline.submitUserMessage(editedContent, images)
 		} catch (error) {
@@ -584,7 +586,7 @@ export const webviewMessageHandler = async (
 			const customModes = await provider.customModesManager.getCustomModes()
 			await updateGlobalState("customModes", customModes)
 
-			await provider.postStateToWebview()
+			await provider.postStateToWebview({ includeClineMessages: true, includeTaskHistory: true })
 			void provider.workspaceTracker
 				?.initializeFilePaths()
 				.catch((err) => provider.log(`Workspace initialization error: ${err}`)) // Don't await.
@@ -873,7 +875,7 @@ export const webviewMessageHandler = async (
 			// handled via metadata; parent resumption occurs through
 			// reopenParentFromDelegation, not via finishSubTask.
 			await provider.clearTask()
-			await provider.postStateToWebview()
+			await provider.postStateToWebview({ includeClineMessages: true, includeTaskHistory: true })
 			break
 		case "didShowAnnouncement":
 			await updateGlobalState("lastShownAnnouncementId", provider.latestAnnouncementId)
@@ -954,7 +956,7 @@ export const webviewMessageHandler = async (
 					results.push(...batchResults)
 
 					// Update the UI after each batch to show progress
-					await provider.postStateToWebview()
+					await provider.postStateToWebview({ includeTaskHistory: true })
 				}
 
 				// Log final results
@@ -1054,7 +1056,7 @@ export const webviewMessageHandler = async (
 				// so a retry after a partial-copy failure still reconciles the store.
 				await provider.taskHistoryStore.invalidateAll()
 				await provider.taskHistoryStore.reconcile()
-				await provider.postStateToWebview()
+				await provider.postStateToWebview({ includeTaskHistory: true })
 				await provider.postMessageToWebview({
 					type: "rooHistoryImportProgress",
 					rooHistoryImportProgress: {
@@ -1932,13 +1934,8 @@ export const webviewMessageHandler = async (
 				const existingPrompts = getGlobalState("customModePrompts") ?? {}
 				const updatedPrompts = { ...existingPrompts, [message.promptMode]: message.customPrompt }
 				await updateGlobalState("customModePrompts", updatedPrompts)
-				const currentState = await provider.getStateToPostToWebview()
-				const stateWithPrompts = {
-					...currentState,
-					customModePrompts: updatedPrompts,
-					hasOpenedModeSelector: currentState.hasOpenedModeSelector ?? false,
-				}
-				await provider.postMessageToWebview({ type: "state", state: stateWithPrompts })
+				// customModePrompts is a setting: lean post (no messages/history) is sufficient.
+				await provider.postStateToWebview()
 
 				if (TelemetryService.hasInstance()) {
 					// Determine which setting was changed by comparing objects

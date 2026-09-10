@@ -160,7 +160,7 @@ const QUEUED_FEEDBACK_SAVE_RETRY_DELAYS_MS = [250, 1_000, 4_000] as const
  * Debounce window for per-token `messageUpdated` posts: at most one post per
  * window carrying the latest state of each updated message.
  */
-export const MESSAGE_UPDATE_DEBOUNCE_MS = 500
+export const MESSAGE_UPDATE_DEBOUNCE_MS = 200
 
 type QueuedAskResolution = { response: ClineAskResponse; requiresDurableAck: boolean }
 
@@ -619,9 +619,12 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 		// MESSAGE_UPDATE_DEBOUNCE_MS carrying the latest state of each updated
 		// message). The provider is held weakly (matching providerRef semantics)
 		// so a disposed task never resurrects the provider.
-		this.messageUpdateDebouncer = new KeyedDebouncer<number, ClineMessage>((messages) => {
+		this.messageUpdateDebouncer = new KeyedDebouncer<number, ClineMessage>(async (messages) => {
+			// Sequentially await each post so that flushNow()/dispose() only
+			// resolve once every messageUpdated has actually been delivered.
+			// Errors are caught per-message so one failure doesn't stop the rest.
 			for (const message of messages) {
-				void this.providerRef
+				await this.providerRef
 					.deref()
 					?.postMessageToWebview({ type: "messageUpdated", clineMessage: message })
 					.catch((error) => {
@@ -669,11 +672,17 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 		this.messageQueueStateChangedHandler = () => {
 			this.emit(RooCodeEventName.TaskUserMessage, this.taskId)
 			this.emit(RooCodeEventName.QueuedMessagesUpdated, this.taskId, this.messageQueueService.messages)
+			// Queue mutations (add/remove/edit/dequeue) are discrete user actions
+			// against the current task, so deliver them with an immediate post that
+			// never carries clineMessages — streaming history is delivered only via
+			// messageUpdated. The full non-message state is included on purpose: a
+			// bare { messageQueue } partial would read apiConfiguration as undefined
+			// on the webview and flash the setup/welcome gate.
 			void this.providerRef
 				.deref()
-				?.postStateToWebviewThrottled()
+				?.postStateToWebview()
 				.catch((error) => {
-					console.error("[Task#messageQueueStateChangedHandler] postStateToWebviewThrottled failed:", error)
+					console.error("[Task#messageQueueStateChangedHandler] postStateToWebview failed:", error)
 				})
 		}
 
@@ -1315,21 +1324,20 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 	private async addToClineMessages(message: ClineMessage) {
 		message.messageId ??= crypto.randomUUID()
 		this.clineMessages.push(message)
-		const provider = this.providerRef.deref()
-		// Unanswered asks must reach the webview before Message listeners can respond against its state.
+		// Delivery rule shared with updateClineMessage: every message is enqueued
+		// into the KeyedDebouncer (keyed by ts, latest state per ts wins) and only
+		// flushed synchronously at a webview-visible boundary. Here the immediate
+		// boundaries are the first partial of a stream (visible start of the
+		// message) and an unanswered ask (must reach the webview before Message
+		// listeners respond against its state). Everything else rides the debounce
+		// window and is flushed by updateClineMessage when finalized. Delivery is
+		// the per-message messageUpdated channel — a full snapshot post is never
+		// needed for a new message; the store appends unknown ts.
 		const requiresImmediateState =
 			message.partial === true || (message.type === "ask" && message.isAnswered !== true)
-		try {
-			await provider?.postStateToWebviewThrottled()
-		} catch (error) {
-			console.error("[Task#addToClineMessages] postStateToWebviewThrottled failed:", error)
-		}
+		this.messageUpdateDebouncer.enqueue(message.ts, message)
 		if (requiresImmediateState) {
-			try {
-				await provider?.flushPostStateToWebviewThrottled()
-			} catch (error) {
-				console.error("[Task#addToClineMessages] flushPostStateToWebviewThrottled failed:", error)
-			}
+			await this.messageUpdateDebouncer.flushNow()
 		}
 		this.emit(RooCodeEventName.Message, { action: "created", message })
 		await this.saveClineMessages()
@@ -1380,13 +1388,15 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 	 * Non-partial messages are synced to cloud telemetry if not already synced.
 	 */
 	private async updateClineMessage(message: ClineMessage) {
-		// Debounce the per-token stream keyed by message ts. A finalized message
-		// (partial === false) flushes immediately — a UI boundary where waiting
-		// for the window would add visible latency. The sync emit below still
-		// fires per message — api.ts depends on it.
+		// Delivery rule shared with addToClineMessages: enqueue into the
+		// KeyedDebouncer (keyed by ts, latest state per ts wins) and flush only at
+		// a webview-visible boundary. Here the immediate boundary is message
+		// finalization (partial === false) — a UI boundary where waiting for the
+		// window would add visible latency. The sync emit below still fires per
+		// message — api.ts depends on it.
 		this.messageUpdateDebouncer.enqueue(message.ts, message)
 		if (message.partial === false) {
-			this.messageUpdateDebouncer.flushNow()
+			await this.messageUpdateDebouncer.flushNow()
 		}
 		this.emit(RooCodeEventName.Message, { action: "updated", message })
 
@@ -2274,7 +2284,7 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 			// The todo list is already set in the constructor if initialTodos were provided
 			// No need to add any messages - the todoList property is already set
 
-			await this.providerRef.deref()?.postStateToWebviewWithoutTaskHistory()
+			await this.providerRef.deref()?.postStateToWebview({ includeClineMessages: true })
 
 			await this.say("text", task, images)
 
@@ -2397,6 +2407,17 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 			// after all history reads succeed and the task is still active.
 			this.hydrateClineMessages(modifiedClineMessages)
 
+			// Hydrate the webview with the full saved message history. Before
+			// Commit 4 this was delivered implicitly by ask() →
+			// addToClineMessages() → postStateToWebview(). Message delivery is
+			// now a point channel (messageUpdated) that only carries the single
+			// new ask message, so the store — which is cleared on task switch
+			// (clineMessagesStore "state" handler) — would never receive the
+			// saved history. Post a full snapshot (messages + seq, no
+			// taskHistory) here, the same hydration point startTask() uses for
+			// new tasks.
+			await this.providerRef.deref()?.postStateToWebview({ includeClineMessages: true })
+
 			// Now present the cline messages to the user and ask if they want to
 			// resume (NOTE: we ran into a bug before where the
 			// apiConversationHistory wouldn't be initialized when opening a old
@@ -2443,7 +2464,11 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 
 			this.isInitialized = true
 
-			const { response, text, images } = await this.ask(askType) // Calls `postStateToWebview`.
+			// Note: ask() no longer posts full state. The saved history was
+			// already hydrated by the explicit postStateToWebview({ includeClineMessages: true })
+			// call above; this ask only delivers the new resume message via the
+			// messageUpdated point channel.
+			const { response, text, images } = await this.ask(askType)
 
 			let responseText: string | undefined
 			let responseImages: string[] | undefined
@@ -2731,12 +2756,9 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 		this.emitFinalTokenUsageUpdate()
 
 		try {
-			await this.providerRef.deref()?.flushPostStateToWebviewThrottled()
+			await this.providerRef.deref()?.postStateToWebview()
 		} catch (error) {
-			console.error(
-				`[Task#abortTask] flushPostStateToWebviewThrottled failed for ${this.taskId}.${this.instanceId}:`,
-				error,
-			)
+			console.error(`[Task#abortTask] postStateToWebview failed for ${this.taskId}.${this.instanceId}:`, error)
 		}
 
 		this.emit(RooCodeEventName.TaskAborted)
@@ -2821,12 +2843,14 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 		}
 
 		// Flush any debounced streaming updates and stop the timer so a disposed
-		// task never posts again (and never leaks the timer handle).
-		try {
-			this.messageUpdateDebouncer.dispose()
-		} catch (error) {
+		// task never posts again (and never leaks the timer handle). Kick the
+		// disposal off synchronously — the rest of disposeOnce (and abortTaskOnce,
+		// which awaits diffReversionPromise) relies on disposeOnce running without
+		// suspending until the diff-reversion setup below — but await it at the end
+		// so dispose() only resolves once final messageUpdated posts are delivered.
+		const debouncerDisposal = this.messageUpdateDebouncer.dispose().catch((error) => {
 			console.error("Error disposing message update debouncer:", error)
-		}
+		})
 
 		// Remove all event listeners to prevent memory leaks.
 		try {
@@ -2880,6 +2904,7 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 
 		await pendingCleanup
 		await this.diffReversionPromise
+		await debouncerDisposal
 	}
 
 	// Subtasks
@@ -3170,18 +3195,12 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 				this.messageCounts.user++
 			}
 
-			// Since we sent off a placeholder api_req_started message to update the
-			// webview while waiting to actually start the API request (to load
-			// potential details for example), we need to update the text of that
-			// message.
+			// NOTE: The api_req_started placeholder above already carries the
+			// resolved apiProtocol (say() at the top of this request). Its final
+			// cost/cancel state is delivered over the messageUpdated channel
+			// (captureUsageData / abortStream below), so no full state post is
+			// needed here. Keep the index for updateApiReqMsg() below.
 			const lastApiReqIndex = findLastIndex(this.clineMessages, (m) => m.say === "api_req_started")
-
-			this.clineMessages[lastApiReqIndex].text = JSON.stringify({
-				apiProtocol,
-			} satisfies ClineApiReqInfo)
-
-			await this.saveClineMessages()
-			await this.providerRef.deref()?.postStateToWebviewWithoutTaskHistory()
 
 			try {
 				let cacheWriteTokens = 0
@@ -3252,13 +3271,29 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 					if (lastMessage && lastMessage.partial) {
 						// lastMessage.ts = Date.now() DO NOT update ts since it is used as a key for virtuoso list
 						lastMessage.partial = false
-						// instead of streaming partialMessage events, we do a save and post like normal to persist to disk
 					}
 
 					// Update `api_req_started` to have cancelled and cost, so that
 					// we can display the cost of the partial stream and the cancellation reason
 					updateApiReqMsg(cancelReason, streamingFailedMessage)
 					await this.saveClineMessages()
+
+					// The throttled full-state post no longer carries clineMessages, so
+					// deliver the final states over the messageUpdated channel instead:
+					// lastMessage finalizes (partial === false) → synchronous flush,
+					// and api_req_started rides the debounce window (its pending update
+					// is also flushed by dispose() on the abort path).
+					if (lastMessage && lastMessage.partial === false) {
+						this.updateClineMessage(lastMessage).catch((error) => {
+							console.error("[Task#abortStream] updateClineMessage failed:", error)
+						})
+					}
+					const apiReqMessage = this.clineMessages[lastApiReqIndex]
+					if (apiReqMessage) {
+						this.updateClineMessage(apiReqMessage).catch((error) => {
+							console.error("[Task#abortStream] updateClineMessage failed:", error)
+						})
+					}
 
 					// Signals to provider that it can retrieve the saved messages
 					// from disk, as abortTask can not be awaited on in nature.
@@ -3901,8 +3936,12 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 					}
 				}
 
+				// All streamed content (text/tool/reasoning) is delivered over the
+				// messageUpdated channel: text blocks finalize via
+				// say(partial=false) → updateClineMessage, and reasoning via
+				// updateClineMessage above — both flush synchronously on
+				// partial === false. No full state post is needed here.
 				await this.saveClineMessages()
-				await this.providerRef.deref()?.postStateToWebviewWithoutTaskHistory()
 
 				// No legacy text-stream tool parser state to reset.
 

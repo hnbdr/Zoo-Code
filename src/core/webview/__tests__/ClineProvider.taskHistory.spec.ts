@@ -765,11 +765,11 @@ describe("ClineProvider Task History Synchronization", () => {
 
 			const state = await provider.getStateToPostToWebview()
 
-			// All tasks from all workspaces should be included
-			expect(state.taskHistory.length).toBe(3)
-			expect(state.taskHistory.some((item: HistoryItem) => item.workspace === "/path/to/workspace1")).toBe(true)
-			expect(state.taskHistory.some((item: HistoryItem) => item.workspace === "/path/to/workspace2")).toBe(true)
-			expect(state.taskHistory.some((item: HistoryItem) => item.workspace === "/different/workspace")).toBe(true)
+			// All tasks from all workspaces should be included (default options include history)
+			expect(state.taskHistory?.length).toBe(3)
+			expect(state.taskHistory?.some((item: HistoryItem) => item.workspace === "/path/to/workspace1")).toBe(true)
+			expect(state.taskHistory?.some((item: HistoryItem) => item.workspace === "/path/to/workspace2")).toBe(true)
+			expect(state.taskHistory?.some((item: HistoryItem) => item.workspace === "/different/workspace")).toBe(true)
 		})
 	})
 
