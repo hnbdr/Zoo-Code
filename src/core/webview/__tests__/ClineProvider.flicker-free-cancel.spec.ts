@@ -359,7 +359,6 @@ describe("ClineProvider flicker-free cancel", () => {
 		})
 
 		provider.postStateToWebview = vi.fn().mockResolvedValue(undefined)
-		provider.postStateToWebviewWithoutTaskHistory = vi.fn().mockResolvedValue(undefined)
 		// Mock private method used by the rehydration path.
 		provider["updateGlobalState"] = vi.fn().mockResolvedValue(undefined)
 		provider.activateProviderProfile = vi.fn().mockResolvedValue(undefined)

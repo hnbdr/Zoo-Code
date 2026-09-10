@@ -78,10 +78,9 @@ describe("Task token usage throttling", () => {
 			},
 			getState: vi.fn().mockResolvedValue({ mode: "code" }),
 			log: vi.fn(),
+			// Debounced messageUpdated posts (KeyedDebouncer) call postMessageToWebview directly.
+			postMessageToWebview: vi.fn().mockResolvedValue(undefined),
 			postStateToWebview: vi.fn().mockResolvedValue(undefined),
-			postStateToWebviewWithoutTaskHistory: vi.fn().mockResolvedValue(undefined),
-			postStateToWebviewThrottled: vi.fn().mockResolvedValue(undefined),
-			flushPostStateToWebviewThrottled: vi.fn().mockResolvedValue(undefined),
 			updateTaskHistory: vi.fn().mockResolvedValue(undefined),
 		}
 

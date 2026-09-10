@@ -12,7 +12,7 @@ export class KeyedDebouncer<Key, Value> {
 	private disposed = false
 
 	constructor(
-		private readonly flush: (values: Value[]) => void,
+		private readonly flush: (values: Value[]) => Promise<void>,
 		private readonly delayMs: number,
 	) {}
 
@@ -36,23 +36,23 @@ export class KeyedDebouncer<Key, Value> {
 	}
 
 	/** Synchronously delivers all pending values. No-op when empty or disposed. */
-	flushNow(): void {
+	async flushNow(): Promise<void> {
 		if (this.disposed) {
 			return
 		}
 
 		this.clearTimer()
-		this.flushPending()
+		await this.flushPending()
 	}
 
 	/** Stops the timer, flushes pending values, and makes the debouncer inert. */
-	dispose(): void {
+	async dispose(): Promise<void> {
 		if (this.disposed) {
 			return
 		}
 
 		this.clearTimer()
-		this.flushPending()
+		await this.flushPending()
 		this.disposed = true
 	}
 
@@ -63,13 +63,13 @@ export class KeyedDebouncer<Key, Value> {
 		}
 	}
 
-	private flushPending(): void {
+	private async flushPending(): Promise<void> {
 		if (this.pending.size === 0) {
 			return
 		}
 
 		const values = Array.from(this.pending.values())
 		this.pending.clear()
-		this.flush(values)
+		await this.flush(values)
 	}
 }

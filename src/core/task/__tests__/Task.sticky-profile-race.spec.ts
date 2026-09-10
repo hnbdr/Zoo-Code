@@ -124,7 +124,6 @@ describe("Task - sticky provider profile init race", () => {
 			on: vi.fn(),
 			off: vi.fn(),
 			postStateToWebview: vi.fn().mockResolvedValue(undefined),
-			postStateToWebviewWithoutTaskHistory: vi.fn().mockResolvedValue(undefined),
 			updateTaskHistory: vi.fn().mockResolvedValue(undefined),
 		} as unknown as ClineProvider
 
