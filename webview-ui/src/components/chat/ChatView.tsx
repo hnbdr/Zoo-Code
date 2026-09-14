@@ -53,6 +53,7 @@ import {
 	useMessageDerivedSelector,
 	useTask,
 } from "@src/hooks/useClineMessages"
+import { useTaskHistory } from "@src/hooks/useTaskHistory"
 import MessageStream from "./MessageStream"
 
 export interface ChatViewProps {
@@ -83,7 +84,6 @@ const ChatViewComponent: React.ForwardRefRenderFunction<ChatViewRef, ChatViewPro
 	const {
 		currentTaskId,
 		currentTaskItem,
-		taskHistory,
 		apiConfiguration,
 		organizationAllowList,
 		mode,
@@ -96,6 +96,11 @@ const ChatViewComponent: React.ForwardRefRenderFunction<ChatViewRef, ChatViewPro
 		showWorktreesInHomeScreen,
 		telemetrySetting,
 	} = useExtensionState()
+
+	// Task 1 (plans/streaming-event-architecture.md): taskHistory is owned by
+	// TaskHistoryStore now — the HistoryPreview gate below subscribes through
+	// the hook instead of re-rendering with the whole context on every post.
+	const taskHistory = useTaskHistory()
 
 	// Derived message data reaches the shell through the store's derived-slice
 	// hooks (plans/derived-store-revision.md §2.3) instead of the old
