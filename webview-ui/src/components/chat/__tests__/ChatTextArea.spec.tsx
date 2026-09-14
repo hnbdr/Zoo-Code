@@ -1,10 +1,12 @@
-import { providerIdentifiers } from "@roo-code/types"
+import { type ClineMessage, type HistoryItem, providerIdentifiers } from "@roo-code/types"
 import { defaultModeSlug } from "@roo/modes"
 
 import { render, fireEvent, screen, act } from "@src/utils/test-utils"
 import { useExtensionState } from "@src/context/ExtensionStateContext"
 import { vscode } from "@src/utils/vscode"
 import * as pathMentions from "@src/utils/path-mentions"
+import { clineMessagesStore } from "@src/context/stores/clineMessagesStore"
+import { taskHistoryStore } from "@src/context/stores/taskHistoryStore"
 
 import { ChatTextArea } from "../ChatTextArea"
 
@@ -33,6 +35,33 @@ const mockConvertToMentionPath = pathMentions.convertToMentionPath as ReturnType
 
 // Mock ExtensionStateContext
 vi.mock("@src/context/ExtensionStateContext")
+
+// ChatTextArea reads clineMessages (Commit 2) and taskHistory (Task 1) from
+// the store singletons via the real hooks, so the specs hydrate the stores
+// directly instead of feeding those fields through the context mock.
+const hydrateStores = (
+	clineMessages: ClineMessage[],
+	taskHistory: Parameters<typeof taskHistoryStore.replaceAll>[0],
+) => {
+	clineMessagesStore.clear()
+	clineMessagesStore.replaceAll(clineMessages)
+	taskHistoryStore.clear()
+	taskHistoryStore.replaceAll(taskHistory)
+}
+
+// HistoryItem factory for the prompt-history fallback: task + workspace drive
+// usePromptHistory filtering; the rest is store bookkeeping.
+const makeHistoryItem = (id: string, ts: number, task: string, workspace = "/test/workspace"): HistoryItem =>
+	({
+		id,
+		number: Number(id),
+		ts,
+		task,
+		tokensIn: 0,
+		tokensOut: 0,
+		totalCost: 0,
+		workspace,
+	}) as HistoryItem
 
 // Custom query function to get the enhance prompt button
 const getEnhancePromptButton = () => {
@@ -64,6 +93,9 @@ describe("ChatTextArea", () => {
 
 	beforeEach(() => {
 		vi.clearAllMocks()
+		// Reset the store singletons so data hydrated by a previous test cannot
+		// leak into this one (the stores survive module scope across tests).
+		hydrateStores([], [])
 		// Default mock implementation for useExtensionState
 		;(useExtensionState as ReturnType<typeof vi.fn>).mockReturnValue({
 			filePaths: [],
@@ -494,19 +526,23 @@ describe("ChatTextArea", () => {
 				{ type: "say", say: "user_feedback", text: "First prompt", ts: 1000 },
 				{ type: "say", say: "user_feedback", text: "Second prompt", ts: 2000 },
 				{ type: "say", say: "user_feedback", text: "Third prompt", ts: 3000 },
-			]
+			] as ClineMessage[]
 
 			beforeEach(() => {
+				// usePromptHistory filters the taskHistory fallback by cwd, so pin
+				// the context mock here (the outer suite's cwd would not match the
+				// items' workspace). ChatTextArea reads conversation messages and
+				// history from the store singletons (Commit 2 / taskHistoryStore),
+				// so the slices are hydrated there instead of via the context mock.
 				;(useExtensionState as ReturnType<typeof vi.fn>).mockReturnValue({
 					filePaths: [],
 					openedTabs: [],
 					apiConfiguration: {
 						apiProvider: providerIdentifiers.anthropic,
 					},
-					taskHistory: [],
-					clineMessages: mockClineMessages,
 					cwd: "/test/workspace",
 				})
+				hydrateStores(mockClineMessages, [])
 			})
 
 			it("should navigate to previous prompt on arrow up when cursor is at beginning", () => {
@@ -648,18 +684,9 @@ describe("ChatTextArea", () => {
 					{ type: "say", say: "user_feedback", text: "Workspace 1 prompt", ts: 1000 },
 					{ type: "say", say: "user_feedback", text: "Other workspace prompt", ts: 2000 },
 					{ type: "say", say: "user_feedback", text: "Workspace 1 prompt 2", ts: 3000 },
-				]
+				] as ClineMessage[]
 
-				;(useExtensionState as ReturnType<typeof vi.fn>).mockReturnValue({
-					filePaths: [],
-					openedTabs: [],
-					apiConfiguration: {
-						apiProvider: providerIdentifiers.anthropic,
-					},
-					taskHistory: [],
-					clineMessages: mixedClineMessages,
-					cwd: "/test/workspace",
-				})
+				hydrateStores(mixedClineMessages, [])
 
 				const setInputValue = vi.fn()
 				const { container } = render(
@@ -678,16 +705,7 @@ describe("ChatTextArea", () => {
 			})
 
 			it("should handle empty conversation history gracefully", () => {
-				;(useExtensionState as ReturnType<typeof vi.fn>).mockReturnValue({
-					filePaths: [],
-					openedTabs: [],
-					apiConfiguration: {
-						apiProvider: providerIdentifiers.anthropic,
-					},
-					taskHistory: [],
-					clineMessages: [],
-					cwd: "/test/workspace",
-				})
+				hydrateStores([], [])
 
 				const setInputValue = vi.fn()
 				const { container } = render(
@@ -707,18 +725,9 @@ describe("ChatTextArea", () => {
 					{ type: "say", say: "user_feedback", text: "", ts: 2000 },
 					{ type: "say", say: "user_feedback", text: "   ", ts: 3000 },
 					{ type: "say", say: "user_feedback", text: "Another valid prompt", ts: 4000 },
-				]
+				] as ClineMessage[]
 
-				;(useExtensionState as ReturnType<typeof vi.fn>).mockReturnValue({
-					filePaths: [],
-					openedTabs: [],
-					apiConfiguration: {
-						apiProvider: providerIdentifiers.anthropic,
-					},
-					taskHistory: [],
-					clineMessages: clineMessagesWithEmpty,
-					cwd: "/test/workspace",
-				})
+				hydrateStores(clineMessagesWithEmpty, [])
 
 				const setInputValue = vi.fn()
 				const { container } = render(
@@ -737,22 +746,15 @@ describe("ChatTextArea", () => {
 			})
 
 			it("should use task history (oldest first) when no conversation messages exist", () => {
+				// replaceAll preserves insertion order (no re-sort), so oldest-first
+				// here means the array is passed in that order even though ts descends.
 				const mockTaskHistory = [
-					{ task: "First task", workspace: "/test/workspace" },
-					{ task: "Second task", workspace: "/test/workspace" },
-					{ task: "Third task", workspace: "/test/workspace" },
+					makeHistoryItem("1", 3000, "First task"),
+					makeHistoryItem("2", 2000, "Second task"),
+					makeHistoryItem("3", 1000, "Third task"),
 				]
 
-				;(useExtensionState as ReturnType<typeof vi.fn>).mockReturnValue({
-					filePaths: [],
-					openedTabs: [],
-					apiConfiguration: {
-						apiProvider: providerIdentifiers.anthropic,
-					},
-					taskHistory: mockTaskHistory,
-					clineMessages: [], // No conversation messages
-					cwd: "/test/workspace",
-				})
+				hydrateStores([], mockTaskHistory) // No conversation messages
 
 				const setInputValue = vi.fn()
 				const { container } = render(
@@ -772,26 +774,14 @@ describe("ChatTextArea", () => {
 
 			it("should reset navigation position when switching between history sources", () => {
 				const setInputValue = vi.fn()
-				const { rerender } = render(
-					<ChatTextArea {...defaultProps} setInputValue={setInputValue} inputValue="" />,
+				render(<ChatTextArea {...defaultProps} setInputValue={setInputValue} inputValue="" />)
+
+				// Start with task history (the describe's beforeEach hydrated
+				// conversation messages). Store updates go through act() so the
+				// mounted component flushes its subscription re-render.
+				act(() =>
+					hydrateStores([], [makeHistoryItem("1", 2000, "Task 1"), makeHistoryItem("2", 1000, "Task 2")]),
 				)
-
-				// Start with task history
-				;(useExtensionState as ReturnType<typeof vi.fn>).mockReturnValue({
-					filePaths: [],
-					openedTabs: [],
-					apiConfiguration: {
-						apiProvider: providerIdentifiers.anthropic,
-					},
-					taskHistory: [
-						{ task: "Task 1", workspace: "/test/workspace" },
-						{ task: "Task 2", workspace: "/test/workspace" },
-					],
-					clineMessages: [],
-					cwd: "/test/workspace",
-				})
-
-				rerender(<ChatTextArea {...defaultProps} setInputValue={setInputValue} inputValue="" />)
 
 				const textarea = document.querySelector("textarea")!
 
@@ -800,22 +790,16 @@ describe("ChatTextArea", () => {
 				expect(setInputValue).toHaveBeenCalledWith("Task 1")
 
 				// Switch to conversation messages
-				;(useExtensionState as ReturnType<typeof vi.fn>).mockReturnValue({
-					filePaths: [],
-					openedTabs: [],
-					apiConfiguration: {
-						apiProvider: providerIdentifiers.anthropic,
-					},
-					taskHistory: [],
-					clineMessages: [
-						{ type: "say", say: "user_feedback", text: "Message 1", ts: 1000 },
-						{ type: "say", say: "user_feedback", text: "Message 2", ts: 2000 },
-					],
-					cwd: "/test/workspace",
-				})
-
 				setInputValue.mockClear()
-				rerender(<ChatTextArea {...defaultProps} setInputValue={setInputValue} inputValue="" />)
+				act(() =>
+					hydrateStores(
+						[
+							{ type: "say", say: "user_feedback", text: "Message 1", ts: 1000 },
+							{ type: "say", say: "user_feedback", text: "Message 2", ts: 2000 },
+						] as ClineMessage[],
+						[],
+					),
+				)
 
 				// Should start from beginning of conversation history (newest first)
 				fireEvent.keyDown(textarea, { key: "ArrowUp" })

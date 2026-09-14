@@ -8,13 +8,23 @@ vi.mock("@/context/ExtensionStateContext", () => ({
 	useExtensionState: vi.fn(),
 }))
 
+// Task 1 (plans/streaming-event-architecture.md): taskHistory moved out of
+// the context into TaskHistoryStore — useTaskSearch reads it through the
+// useTaskHistory hook, so the spec drives the hook mock instead of the
+// context's taskHistory field.
+vi.mock("@/hooks/useTaskHistory", () => ({
+	useTaskHistory: vi.fn(),
+}))
+
 vi.mock("@/utils/highlight", () => ({
 	highlightFzfMatch: vi.fn((text) => `<mark>${text}</mark>`),
 }))
 
 import { useExtensionState } from "@/context/ExtensionStateContext"
+import { useTaskHistory } from "@/hooks/useTaskHistory"
 
 const mockUseExtensionState = useExtensionState as ReturnType<typeof vi.fn>
+const mockUseTaskHistory = useTaskHistory as ReturnType<typeof vi.fn>
 
 const mockTaskHistory: HistoryItem[] = [
 	{
@@ -55,9 +65,9 @@ describe("useTaskSearch", () => {
 	beforeEach(() => {
 		vi.clearAllMocks()
 		mockUseExtensionState.mockReturnValue({
-			taskHistory: mockTaskHistory,
 			cwd: "/workspace/project1",
 		} as any)
+		mockUseTaskHistory.mockReturnValue(mockTaskHistory)
 	})
 
 	it("returns all tasks by default", () => {
@@ -211,10 +221,7 @@ describe("useTaskSearch", () => {
 	})
 
 	it("handles empty task history", () => {
-		mockUseExtensionState.mockReturnValue({
-			taskHistory: [],
-			cwd: "/workspace/project1",
-		} as any)
+		mockUseTaskHistory.mockReturnValue([])
 
 		const { result } = renderHook(() => useTaskSearch())
 
@@ -244,10 +251,7 @@ describe("useTaskSearch", () => {
 			},
 		] as HistoryItem[]
 
-		mockUseExtensionState.mockReturnValue({
-			taskHistory: incompleteTaskHistory,
-			cwd: "/workspace/project1",
-		} as any)
+		mockUseTaskHistory.mockReturnValue(incompleteTaskHistory)
 
 		const { result } = renderHook(() => useTaskSearch())
 

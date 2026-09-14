@@ -3,9 +3,16 @@ import { render, screen, fireEvent } from "@/utils/test-utils"
 import { useExtensionState } from "@src/context/ExtensionStateContext"
 
 import HistoryView from "../HistoryView"
+import { useTaskHistory } from "@src/hooks/useTaskHistory"
 
 vi.mock("@src/context/ExtensionStateContext")
 vi.mock("@src/utils/vscode")
+// Task 1: taskHistory is read through the useTaskHistory store hook now
+// (HistoryView → useTaskSearch), so the spec drives the hook mock instead of
+// the context's taskHistory field.
+vi.mock("@src/hooks/useTaskHistory", () => ({
+	useTaskHistory: vi.fn(),
+}))
 
 vi.mock("@src/i18n/TranslationContext", () => ({
 	useAppTranslation: () => ({
@@ -38,9 +45,9 @@ describe("HistoryView", () => {
 	beforeEach(() => {
 		vi.clearAllMocks()
 		;(useExtensionState as ReturnType<typeof vi.fn>).mockReturnValue({
-			taskHistory: mockTaskHistory,
 			cwd: "/test/workspace",
 		})
+		;(useTaskHistory as ReturnType<typeof vi.fn>).mockReturnValue(mockTaskHistory)
 	})
 
 	it("renders the history interface", () => {

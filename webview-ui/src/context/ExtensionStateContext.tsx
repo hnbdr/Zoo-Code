@@ -35,13 +35,15 @@ import { convertTextMateToHljs } from "@src/utils/textMateToHljs"
 import { StringCache } from "@src/utils/stringCache"
 
 import { clineMessagesStore } from "@src/context/stores/clineMessagesStore"
+import { taskHistoryStore } from "@src/context/stores/taskHistoryStore"
 
-// POC: one StringCache instance (class taking a filter in the constructor),
-// created once per webview lifetime (module import time):
+// StringCache instance (class taking a filter in the constructor), created once
+// per webview lifetime (module import time):
 //
-//   historyCache — task data (taskHistory / currentTaskItem). Cross-task: the
-//                  list holds EVERY task ever run in this workspace and is
-//                  never cleared on task switch. No filter.
+//   historyCache — currentTaskItem. Cross-task data: it is not cleared on task
+//                  switch. No filter. The `taskHistory` array it used to intern
+//                  moved into TaskHistoryStore (Task 1), which owns its own
+//                  cache for it.
 //   messageCache — clineMessages. Moved into ClineMessagesStore (Commit 2):
 //                  the store owns its own task-scoped StringCache with the
 //                  partial filter `(msg) => !msg.partial` and clears it on
@@ -51,8 +53,11 @@ const historyCache = new StringCache()
 // Commit 2: `clineMessages` / `clineMessagesSeq` are owned by ClineMessagesStore
 // (a useSyncExternalStore slice) and are removed from the context state, so a
 // streaming push no longer recreates the context value (see plans §Commit 2).
-// The type stays the full ExtensionState minus those two IPC-contract fields.
-export type ContextState = Omit<ExtensionState, "clineMessages" | "clineMessagesSeq">
+// Task 1: `taskHistory` is owned by TaskHistoryStore for the same reason —
+// every history post (full-state, taskHistoryUpdated, taskHistoryItemUpdated)
+// used to recreate the context value and re-render all its consumers.
+// The type stays the full ExtensionState minus those three IPC-contract fields.
+export type ContextState = Omit<ExtensionState, "clineMessages" | "clineMessagesSeq" | "taskHistory">
 
 export interface ExtensionStateContextType extends ContextState {
 	historyPreviewCollapsed?: boolean // Add the new state property
@@ -176,21 +181,24 @@ export interface ExtensionStateContextType extends ContextState {
 export const ExtensionStateContext = createContext<ExtensionStateContextType | undefined>(undefined)
 
 export const mergeExtensionState = (prevState: ContextState, newState: Partial<ExtensionState>) => {
-	// Commit 2: strip the streaming slice from BOTH inputs. ContextState omits
-	// clineMessages / clineMessagesSeq, but the structural type allows callers to
-	// hand in a value that still carries them (test fixtures simulate a
-	// pre-Commit-2 snapshot), and leaking them through prevRest would re-introduce
-	// the slice into the context value — the exact re-render source this refactor
-	// removes. The store applies its own seq guard internally.
+	// Commit 2 / Task 1: strip the store-owned slices from BOTH inputs.
+	// ContextState omits clineMessages / clineMessagesSeq / taskHistory, but the
+	// structural type allows callers to hand in a value that still carries them
+	// (test fixtures simulate a pre-refactor snapshot), and leaking them through
+	// prevRest would re-introduce the slices into the context value — the exact
+	// re-render source this refactor removes. ClineMessagesStore applies its own
+	// seq guard internally; TaskHistoryStore self-hydrates from the same posts.
 	const {
 		customModePrompts: prevCustomModePrompts,
 		experiments: prevExperiments,
 		clineMessages: _streamingMessagesPrev,
 		clineMessagesSeq: _streamingSeqPrev,
+		taskHistory: _taskHistoryPrev,
 		...prevRest
 	} = prevState as ContextState & {
 		clineMessages?: ExtensionState["clineMessages"]
 		clineMessagesSeq?: ExtensionState["clineMessagesSeq"]
+		taskHistory?: ExtensionState["taskHistory"]
 	}
 
 	const {
@@ -205,6 +213,9 @@ export const mergeExtensionState = (prevState: ContextState, newState: Partial<E
 		// switch, so this merge is purely about the non-streaming fields.
 		clineMessages: _streamingMessages,
 		clineMessagesSeq: _streamingSeq,
+		// Task 1: same for the task history — TaskHistoryStore owns it and
+		// hydrates from the window "message" events itself.
+		taskHistory: _taskHistory,
 		...newRest
 	} = newState
 
@@ -226,7 +237,6 @@ export const mergeExtensionState = (prevState: ContextState, newState: Partial<E
 const createInitialExtensionState = (): ContextState => ({
 	apiConfiguration: {},
 	version: "",
-	taskHistory: [],
 	shouldShowAnnouncement: false,
 	allowedCommands: [],
 	deniedCommands: [],
@@ -311,9 +321,9 @@ export const ExtensionStateContextProvider: React.FC<{
 }> = ({ children, initialState }) => {
 	const [state, setState] = useState<ContextState>(() => {
 		const mergedState = mergeExtensionState(createInitialExtensionState(), initialState ?? {})
-		if (mergedState.taskHistory.length > 0) {
-			historyCache.intern(mergedState.taskHistory)
-		}
+		// Task 1: taskHistory is no longer part of the context (TaskHistoryStore
+		// hydrates it from the same `state` posts and interns it with its own
+		// cache), so only the remaining currentTaskItem is interned here.
 		if (mergedState.currentTaskItem) {
 			historyCache.intern(mergedState.currentTaskItem)
 		}
@@ -377,12 +387,10 @@ export const ExtensionStateContextProvider: React.FC<{
 					// Commit 2: clineMessages / clineMessagesSeq are owned by
 					// ClineMessagesStore (self-hydrating listener — §7.3). It seq-guards
 					// full-state posts, interns the messages and clears on task switch,
-					// so the provider only merges the remaining fields. historyCache
-					// below is cross-task data (the full history list persists across
-					// switches).
-					if (newState.taskHistory) {
-						historyCache.intern(newState.taskHistory)
-					}
+					// so the provider only merges the remaining fields. Task 1: the
+					// same for taskHistory → TaskHistoryStore (cross-task data, no seq,
+					// no task-switch clear). historyCache below now covers only
+					// currentTaskItem.
 					if (newState.currentTaskItem) {
 						historyCache.intern(newState.currentTaskItem)
 					}
@@ -489,38 +497,22 @@ export const ExtensionStateContextProvider: React.FC<{
 					}
 					break
 				}
-				case "taskHistoryUpdated": {
-					// Efficiently update just the task history without replacing entire state
-					if (message.taskHistory !== undefined) {
-						setState((prevState) => ({
-							...prevState,
-							taskHistory: message.taskHistory!,
-						}))
-					}
-					break
-				}
+				// Task 1: the task-history array itself moved to TaskHistoryStore
+				// (self-hydrating listener), so the old `taskHistoryUpdated` case is
+				// gone — the store applies replaceAll for it. `taskHistoryItemUpdated`
+				// keeps only the side-effect the store cannot do: keeping
+				// `currentTaskItem` (still context state) in sync with the upserted
+				// item. The store's listener applies the array update independently.
 				case "taskHistoryItemUpdated": {
 					const item = message.taskHistoryItem
 					if (!item) {
 						break
 					}
 					setState((prevState) => {
-						const existingIndex = prevState.taskHistory.findIndex((h) => h.id === item.id)
-						let nextHistory: typeof prevState.taskHistory
-						if (existingIndex === -1) {
-							nextHistory = [item, ...prevState.taskHistory]
-						} else {
-							nextHistory = [...prevState.taskHistory]
-							nextHistory[existingIndex] = item
+						if (prevState.currentTaskItem?.id !== item.id) {
+							return prevState
 						}
-						// Keep UI semantics consistent with extension: newest-first ordering.
-						nextHistory.sort((a, b) => b.ts - a.ts)
-						return {
-							...prevState,
-							taskHistory: nextHistory,
-							currentTaskItem:
-								prevState.currentTaskItem?.id === item.id ? item : prevState.currentTaskItem,
-						}
+						return { ...prevState, currentTaskItem: item }
 					})
 					break
 				}
@@ -536,14 +528,18 @@ export const ExtensionStateContextProvider: React.FC<{
 		}
 	}, [handleMessage])
 
-	// Commit 2: ClineMessagesStore self-hydrates from the window "message" events
-	// (§7.3). Attach its listener for the provider's lifetime; the store handles
-	// `state` posts (seq-guarded replaceAll + task-switch clear) and streaming
-	// `messageUpdated` pushes itself, so this provider never re-renders on them.
+	// Commit 2 / Task 1: both store singletons self-hydrate from the window
+	// "message" events (§7.3). Attach their listeners for the provider's
+	// lifetime; ClineMessagesStore handles `state` posts (seq-guarded replaceAll
+	// + task-switch clear) and streaming `messageUpdated` pushes, TaskHistoryStore
+	// handles the history posts (`state`.taskHistory, taskHistoryUpdated,
+	// taskHistoryItemUpdated), so this provider never re-renders on them.
 	useEffect(() => {
 		clineMessagesStore.start()
+		taskHistoryStore.start()
 		return () => {
 			clineMessagesStore.stop()
+			taskHistoryStore.stop()
 		}
 	}, [])
 

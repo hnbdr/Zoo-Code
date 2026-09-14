@@ -7,6 +7,7 @@ import {
 	type ExperimentId,
 	type ExtensionState,
 	type ClineMessage,
+	type HistoryItem,
 	type MarketplaceItem,
 	type MarketplaceInstalledMetadata,
 	type RouterModels,
@@ -55,6 +56,12 @@ const ChatFontSizeTestComponent = () => {
 			</button>
 		</div>
 	)
+}
+
+const CurrentTaskItemTestComponent = () => {
+	const { currentTaskItem } = useExtensionState()
+
+	return <div data-testid="current-task-item">{JSON.stringify(currentTaskItem)}</div>
 }
 
 const ApiConfigTestComponent = () => {
@@ -545,5 +552,95 @@ describe("mergeExtensionState", () => {
 			expect(result).not.toHaveProperty("clineMessagesSeq")
 			expect(result.currentTaskId).toBe("task-2")
 		})
+
+		it("strips taskHistory from BOTH inputs so the context never carries the history slice", () => {
+			const prevState = {
+				...baseState,
+				taskHistory: [{ id: "stale", number: 1, ts: 1, task: "stale" }] as HistoryItem[],
+			}
+
+			const result = mergeExtensionState(prevState, {
+				taskHistory: [{ id: "fresh", number: 2, ts: 2, task: "fresh" }] as HistoryItem[],
+				currentTaskId: "task-3",
+			})
+
+			// TaskHistoryStore owns the array (self-hydrating from the same
+			// posts); leaking it through either input would re-create the context
+			// value on every history post. Other fields still merge normally.
+			expect(result).not.toHaveProperty("taskHistory")
+			expect(result.currentTaskId).toBe("task-3")
+		})
+	})
+})
+
+describe("taskHistoryItemUpdated currentTaskItem sync", () => {
+	// The task-history ARRAY moved to TaskHistoryStore; the provider keeps only
+	// the side-effect the store cannot do: keeping `currentTaskItem` (still
+	// context state) in sync with an upserted item that matches the active task.
+	const item = (id: string, task: string): HistoryItem =>
+		({
+			id,
+			number: 1,
+			ts: 100,
+			task,
+			tokensIn: 0,
+			tokensOut: 0,
+			totalCost: 0,
+		}) as HistoryItem
+
+	it("updates currentTaskItem when the upserted item matches its id", () => {
+		render(
+			<ExtensionStateContextProvider initialState={{ currentTaskItem: item("task-1", "before") }}>
+				<CurrentTaskItemTestComponent />
+			</ExtensionStateContextProvider>,
+		)
+
+		act(() => {
+			window.dispatchEvent(
+				new MessageEvent("message", {
+					data: { type: "taskHistoryItemUpdated", taskHistoryItem: item("task-1", "after") },
+				}),
+			)
+		})
+
+		expect(JSON.parse(screen.getByTestId("current-task-item").textContent!)).toEqual(
+			expect.objectContaining({ id: "task-1", task: "after" }),
+		)
+	})
+
+	it("keeps currentTaskItem untouched when the upserted item is a different task", () => {
+		render(
+			<ExtensionStateContextProvider initialState={{ currentTaskItem: item("task-1", "before") }}>
+				<CurrentTaskItemTestComponent />
+			</ExtensionStateContextProvider>,
+		)
+
+		act(() => {
+			window.dispatchEvent(
+				new MessageEvent("message", {
+					data: { type: "taskHistoryItemUpdated", taskHistoryItem: item("task-2", "other") },
+				}),
+			)
+		})
+
+		expect(JSON.parse(screen.getByTestId("current-task-item").textContent!)).toEqual(
+			expect.objectContaining({ id: "task-1", task: "before" }),
+		)
+	})
+
+	it("ignores a taskHistoryItemUpdated without an item", () => {
+		render(
+			<ExtensionStateContextProvider initialState={{ currentTaskItem: item("task-1", "before") }}>
+				<CurrentTaskItemTestComponent />
+			</ExtensionStateContextProvider>,
+		)
+
+		act(() => {
+			window.dispatchEvent(new MessageEvent("message", { data: { type: "taskHistoryItemUpdated" } }))
+		})
+
+		expect(JSON.parse(screen.getByTestId("current-task-item").textContent!)).toEqual(
+			expect.objectContaining({ id: "task-1", task: "before" }),
+		)
 	})
 })
