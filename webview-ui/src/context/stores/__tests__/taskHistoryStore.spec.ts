@@ -56,6 +56,23 @@ describe("TaskHistoryStore", () => {
 			expect(listener).toHaveBeenCalledTimes(1)
 			expect(store.getSnapshot()).toEqual([])
 		})
+		it("keeps canonical element references across identical-content re-posts", () => {
+			store.replaceAll([makeItem("1", 200), makeItem("2", 100)])
+			const canonical = store.getSnapshot()
+
+			// Structured-clone twin of the same content: every item maps back to
+			// its registered canonical → the snapshot keeps its reference.
+			store.replaceAll([makeItem("1", 200), makeItem("2", 100)])
+			expect(store.getSnapshot()).toBe(canonical)
+
+			// Changed content IS adopted; the untouched item keeps its reference.
+			store.replaceAll([makeItem("1", 200, "renamed"), makeItem("2", 100)])
+			const next = store.getSnapshot()
+			expect(next).not.toBe(canonical)
+			expect(next[0]).not.toBe(canonical[0])
+			expect(next[0]?.task).toBe("renamed")
+			expect(next[1]).toBe(canonical[1])
+		})
 	})
 
 	describe("upsertItem", () => {
@@ -131,17 +148,27 @@ describe("TaskHistoryStore", () => {
 			expect(listener).toHaveBeenCalledTimes(1)
 		})
 
-		it("an upsert that replaces with a different object still notifies", () => {
-			// Content-deduplication (canonical references for identical content)
-			// is task 2 (see plans/streaming-event-architecture.md) — until then
-			// any fresh object is a real snapshot change.
+		it("skip-notify: an upsert with identical content maps to the canonical and publishes nothing", () => {
+			// Task 2 dedup: a fresh object with unchanged content is a duplicate
+			// post, not a snapshot change.
 			store.replaceAll([makeItem("1", 100)])
-
 			const listener = vi.fn()
 			store.subscribe(listener)
+
 			store.upsertItem(makeItem("1", 100))
 
+			expect(listener).not.toHaveBeenCalled()
+		})
+
+		it("an upsert that genuinely changes the item still notifies", () => {
+			store.replaceAll([makeItem("1", 100)])
+			const listener = vi.fn()
+			store.subscribe(listener)
+
+			store.upsertItem(makeItem("1", 100, "renamed"))
+
 			expect(listener).toHaveBeenCalledTimes(1)
+			expect(store.getSnapshot()[0]?.task).toBe("renamed")
 		})
 
 		it("clear() notifies even from an already-empty history (fresh [] reference)", () => {
@@ -152,6 +179,19 @@ describe("TaskHistoryStore", () => {
 
 			expect(listener).toHaveBeenCalledTimes(1)
 			expect(store.getSnapshot()).toEqual([])
+		})
+
+		it("clear() drops the registry so identical content is adopted as new canonicals", () => {
+			store.replaceAll([makeItem("1", 100)])
+			const before = store.getSnapshot()[0]
+
+			store.clear()
+
+			// After the registry reset an identical-content re-post maps to a
+			// NEW reference (proves clear() reset the registry, not just the
+			// snapshot).
+			store.replaceAll([makeItem("1", 100)])
+			expect(store.getSnapshot()[0]).not.toBe(before)
 		})
 
 		it("notifies every listener; unsubscribing one leaves the others attached", () => {
