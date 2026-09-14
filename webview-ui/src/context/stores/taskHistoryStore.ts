@@ -1,6 +1,6 @@
 import { type ExtensionMessage, type HistoryItem } from "@roo-code/types"
 
-import { StringCache } from "@src/utils/stringCache"
+import { CanonicalRegistry, sameElements } from "./dedupRegistry"
 
 /**
  * TaskHistoryStore — the frontend slice that owns the workspace `taskHistory`
@@ -22,15 +22,17 @@ import { StringCache } from "@src/utils/stringCache"
  *
  * Domain semantics (mirroring the previous ExtensionStateContext behavior):
  * - `replaceAll(items)`: full-list hydration (state posts and
- *   `taskHistoryUpdated`). Interns the items before publishing.
+ *   `taskHistoryUpdated`). Canonicalizes the items before publishing; a
+ *   re-post whose content is unchanged publishes nothing at all.
  * - `upsertItem(item)`: the merge logic moved verbatim out of the
  *   `taskHistoryItemUpdated` case — replace by `id`, otherwise prepend, then
  *   sort newest-first (`b.ts - a.ts`) to keep UI semantics consistent with
  *   the extension.
- * - Interning: a store-owned `StringCache` (no filter — history items have no
- *   partial/streaming shape) replaces the `historyCache` role for the
- *   `taskHistory` array. `currentTaskItem` is NOT part of this store: it stays
- *   in the context, interned by the provider's remaining `historyCache`.
+ * - Canonicalization: a store-owned `CanonicalRegistry` keyed by `id` interns
+ *   strings internally (no filter — history items have no partial/streaming
+ *   shape) and keeps one canonical instance per item. `currentTaskItem` is NOT
+ *   part of this store: it stays in the context, interned by the provider's
+ *   remaining `historyCache`.
  * - Skip-notify: no listener is called when the snapshot did not change.
  *
  * Self-hydration: like ClineMessagesStore, the module singleton attaches a
@@ -47,7 +49,9 @@ export interface TaskHistoryStore {
 
 	/**
 	 * Full-list hydration (a `{type:"state"}` post with `taskHistory`, or a
-	 * `{type:"taskHistoryUpdated"}` post). Interns the items before publishing.
+	 * `{type:"taskHistoryUpdated"}` post). Canonicalizes the items (string
+	 * interning + one reference per `id`) before publishing; a re-post whose
+	 * every element maps back to the snapshot publishes nothing (skip-notify).
 	 */
 	replaceAll: (items: HistoryItem[]) => void
 
@@ -75,16 +79,18 @@ export interface TaskHistoryStore {
 
 /**
  * Factory form (mirrors `createClineMessagesStore`): each instance owns its
- * own history, listener set and StringCache, so tests can construct isolated
- * stores without cross-test leakage.
+ * own history, listener set and canonical registry (string interning
+ * included), so tests can construct isolated stores without cross-test
+ * leakage.
  */
 export const createTaskHistoryStore = (): TaskHistoryStore => {
 	let history: HistoryItem[] = []
 	const listeners = new Set<() => void>()
-	// Cross-task interning: the list holds every task ever run in this
-	// workspace, so (like the old context-side historyCache) this cache is
-	// never cleared on task switch — only by the explicit clear() below.
-	const historyCache = new StringCache()
+	// Cross-task canonicalization (the registry owns the string interning): the
+	// list holds every task ever run in this workspace, so — like the old
+	// context-side historyCache — nothing is cleared on task switch, only by
+	// the explicit clear() below.
+	const historyRegistry = new CanonicalRegistry<HistoryItem>((item) => item.id)
 	let started = false
 
 	const notify = () => {
@@ -103,21 +109,35 @@ export const createTaskHistoryStore = (): TaskHistoryStore => {
 	}
 
 	const replaceAll = (incoming: HistoryItem[]) => {
-		// Intern BEFORE publishing so the snapshot's string fields point to the
-		// canonical instances shared with prior posts.
-		historyCache.intern(incoming)
-		setHistory(incoming)
+		// Canonicalize BEFORE publishing: strings re-bind to the shared
+		// instances and every item maps back to its registered reference. A
+		// re-post of unchanged content comes back element-wise equal to the
+		// current snapshot → skip-notify.
+		const canonical = historyRegistry.internList(incoming)
+		if (sameElements(canonical, history)) {
+			return
+		}
+		setHistory(canonical)
 	}
 
 	const upsertItem = (item: HistoryItem) => {
-		historyCache.intern(item)
-		const existingIndex = history.findIndex((h) => h.id === item.id)
+		// Interning + canonical reference in one step: an identical-content
+		// re-post maps back to the instance already in the snapshot, while a
+		// genuinely changed item (e.g. updated totalCost) is adopted.
+		const canonical = historyRegistry.intern(item)
+		const existingIndex = history.findIndex((h) => h.id === canonical.id)
+		if (existingIndex !== -1 && history[existingIndex] === canonical) {
+			// Duplicate post — the snapshot already carries the canonical
+			// instance. Identical content means identical `ts`, so the sort
+			// below would not move anything either: skip-notify.
+			return
+		}
 		let next: HistoryItem[]
 		if (existingIndex === -1) {
-			next = [item, ...history]
+			next = [canonical, ...history]
 		} else {
 			next = history.slice()
-			next[existingIndex] = item
+			next[existingIndex] = canonical
 		}
 		// Keep UI semantics consistent with the extension: newest-first order.
 		next.sort((a, b) => b.ts - a.ts)
@@ -125,7 +145,9 @@ export const createTaskHistoryStore = (): TaskHistoryStore => {
 	}
 
 	const clear = () => {
-		historyCache.clear()
+		// Drops the canonical references AND the interned strings (the registry
+		// owns the StringCache).
+		historyRegistry.clear()
 		// Fresh empty array so an existing [] snapshot reference still resets
 		// listeners that hold the previous list.
 		setHistory([])
@@ -189,7 +211,7 @@ export const createTaskHistoryStore = (): TaskHistoryStore => {
 		clear,
 		start,
 		stop,
-		getCacheSize: () => historyCache.size,
+		getCacheSize: () => historyRegistry.stringCacheSize,
 	}
 }
 

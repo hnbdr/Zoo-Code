@@ -93,9 +93,15 @@ vi.mock("@roo/api", () => ({
 }))
 
 // Mock Mention so task.text renders as plain text without pulling in the
-// @roo/context-mentions regex dependency.
+// @roo/context-mentions regex dependency. The mock is a spy: Mention renders
+// inside the collapsed TaskHeader on every render of the component, so its
+// call count doubles as a TaskHeader render counter for the dedup tests.
+const { MentionSpy } = vi.hoisted(() => ({ MentionSpy: vi.fn() }))
 vi.mock("../Mention", () => ({
-	Mention: ({ text }: { text?: string }) => <span>{text}</span>,
+	Mention: ({ text }: { text?: string }) => {
+		MentionSpy()
+		return <span>{text}</span>
+	},
 }))
 
 // Commit 2: TaskHeader reads the task message through the REAL
@@ -124,6 +130,7 @@ describe("TaskHeader", () => {
 	// with one task message ("Test task" — the text the existing assertions
 	// expect), matching the previous module-level hook mock.
 	beforeEach(() => {
+		MentionSpy.mockClear()
 		clineMessagesStore.clear()
 		clineMessagesStore.replaceAll([makeTaskMessage(1, "Test task")])
 	})
@@ -351,6 +358,29 @@ describe("TaskHeader", () => {
 			renderTaskHeader({ contextTokens: 250 })
 
 			expect(screen.getByText("25%")).toBeInTheDocument()
+		})
+	})
+
+	describe("Task 2 — dedup registry keeps at(0) stable across identical-content posts", () => {
+		it("survives replaceAll with fresh objects of identical content", () => {
+			renderTaskHeader()
+			// Baseline: the mount render(s) of the collapsed header.
+			const baseline = MentionSpy.mock.calls.length
+
+			// Structured-clone twin of the beforeEach hydration content: fresh
+			// array, fresh message object, same ts + text. The registry maps it
+			// back to the canonical instance → skip-notify → zero re-renders.
+			act(() => {
+				clineMessagesStore.replaceAll([makeTaskMessage(1, "Test task")])
+			})
+			expect(MentionSpy.mock.calls.length).toBe(baseline)
+
+			// Control: genuinely different content DOES re-render the header.
+			act(() => {
+				clineMessagesStore.replaceAll([makeTaskMessage(2, "Replaced task")])
+			})
+			expect(MentionSpy.mock.calls.length).toBeGreaterThan(baseline)
+			expect(screen.getByText("Replaced task")).toBeInTheDocument()
 		})
 	})
 

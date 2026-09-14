@@ -61,8 +61,8 @@ const TaskHeader = ({
 	const { t } = useTranslation()
 	const { apiConfiguration, currentTaskItem } = useExtensionState()
 	// Task text: the first message, read from the store via a selector. The
-	// store deduplicates messages by ts (canonical instances), keeping the
-	// at(0) reference stable across identically-shaped full-state posts.
+	// store canonicalizes messages by ts (dedupRegistry), keeping the at(0)
+	// reference stable across identical-content full-state posts.
 	const task = useClineMessagesSelector((messages) => messages.at(0))
 	const { id: modelId, info: model } = useSelectedModel(apiConfiguration)
 	const [isTaskExpanded, setIsTaskExpanded] = useState(false)

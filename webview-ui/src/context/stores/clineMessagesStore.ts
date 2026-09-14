@@ -13,7 +13,7 @@ import { combineCommandSequences } from "@roo/combineCommandSequences"
 import { getApiMetrics, hasTokenUsageChanged } from "@roo/getApiMetrics"
 import { getLatestTodo } from "@roo/todo"
 
-import { StringCache } from "@src/utils/stringCache"
+import { CanonicalRegistry, sameElements } from "./dedupRegistry"
 
 /**
  * ClineMessagesStore — the frontend slice that owns the task's `clineMessages`
@@ -42,9 +42,12 @@ import { StringCache } from "@src/utils/stringCache"
  *   from `mergeExtensionState` — skip when incoming seq <= last applied seq.
  * - `applyUpdates(update)`: last-write-wins replace by `ts`; unknown `ts`
  *   APPENDS instead of the old "console.warn + drop".
- * - Interning: non-partial messages are interned through the task-scoped
- *   `StringCache` (filter `(msg) => !msg.partial`); partial (mid-stream)
- *   messages pass through by reference and are never pinned in the cache.
+ * - Canonicalization: every message flows through the task-scoped
+ *   `CanonicalRegistry` keyed by `ts`. The registry interns non-partial
+ *   messages' strings internally (partials are transient, their text churns
+ *   every tick) and keeps ONE canonical instance per content, so an
+ *   identical-content re-post of the full list — or a duplicate update —
+ *   publishes nothing.
  * - Task switch: the `state` handler detects a `currentTaskId` change and
  *   clears the previous task's messages + interned strings before hydrating
  *   the new one. `clear()` (also used by the provider on mount / tests) does
@@ -137,22 +140,6 @@ const completionCheckpointEqual = (a: CompletionCheckpoint | undefined, b: Compl
 	a === b || (!!a && !!b && a.ts === b.ts && a.commitHash === b.commitHash)
 
 /**
- * Reuse `prev` when `candidate` is element-wise identical. The combiners and
- * `msgs.slice(1)` allocate a fresh array on every derive even when nothing
- * about the collapsed stream moved, so without this the slice object would
- * churn per flush and defeat the all-fields identity rule.
- */
-const sameElements = (candidate: ClineMessage[], prev: ClineMessage[]): boolean => {
-	if (candidate === prev) {
-		return true
-	}
-	if (candidate.length !== prev.length) {
-		return false
-	}
-	return candidate.every((message, index) => message === prev[index])
-}
-
-/**
  * Scans backwards for the ts of the last completion-result row: a `say`, or an
  * `ask` whose text is non-empty (an ask still streaming its text does not
  * count). Mirrors the old MessageStream boundary memo exactly.
@@ -203,7 +190,9 @@ export interface ClineMessagesStore {
 	 * Full-state hydration (a `{type:"state"}` post). Applies the seq guard:
 	 * when both the incoming and the stored seq are defined and the incoming is
 	 * NOT strictly greater, the new messages are ignored (a stale push must not
-	 * overwrite newer ones). Interns the array before publishing.
+	 * overwrite newer ones). Canonicalizes the array (string interning + one
+	 * reference per `ts`) before publishing; a re-post whose every element maps
+	 * back to the current snapshot publishes nothing (skip-notify).
 	 */
 	replaceAll: (messages: ClineMessage[], seq?: number) => void
 
@@ -211,7 +200,9 @@ export interface ClineMessagesStore {
 	 * Streaming update — `{type:"messageUpdated", clineMessage}` (single) or a
 	 * batch (Commit 1's `messagesUpdated` shape). Last-write-wins by `ts`;
 	 * unknown `ts` values are appended (state sync issue, no longer silently
-	 * dropped).
+	 * dropped). Each update passes through the registry: an identical-content
+	 * duplicate publishes nothing, a genuinely changed same-ts payload is
+	 * adopted as the new canonical.
 	 */
 	applyUpdates: (updates: ClineMessage | ClineMessage[]) => void
 
@@ -250,15 +241,24 @@ const isSingleMessageUpdated = (
 
 /**
  * Factory form (generalized by `createSliceStore` in Commit 3). Each instance
- * owns its own messages, seq, listener set and task-scoped StringCache, so
- * tests can construct isolated stores without cross-test leakage.
+ * owns its own messages, seq, listener set and task-scoped canonical registry
+ * (string interning included), so tests can construct isolated stores without
+ * cross-test leakage.
  */
 export const createClineMessagesStore = (): ClineMessagesStore => {
 	let messages: ClineMessage[] = []
 	let derived: DerivedMessageState = initialDerived
 	let seq: number | undefined
 	const listeners = new Set<() => void>()
-	const messageCache = new StringCache((msg) => !msg.partial)
+	// Canonical instance per `ts`; the registry owns the string interning (its
+	// filter skips partial messages). The `partial` fast path below keeps the
+	// streaming hot path from ever paying the JSON.stringify comparison: a
+	// partial is fresh content by definition, so it is always adopted.
+	const messageRegistry = new CanonicalRegistry<ClineMessage>((msg) => msg.ts, {
+		shouldInternString: (msg) => !msg.partial,
+		contentEquals: (incoming, canonical) =>
+			incoming.partial !== true && JSON.stringify(incoming) === JSON.stringify(canonical),
+	})
 	let started = false
 	// Last task id observed in a `{type:"state"}` post. A change means the old
 	// ChatView tree (key={currentTaskId} in App.tsx) has been unmounted and the
@@ -398,12 +398,18 @@ export const createClineMessagesStore = (): ClineMessagesStore => {
 		if (incomingSeq !== undefined && seq !== undefined && incomingSeq <= seq) {
 			return
 		}
-		// Intern BEFORE publishing so the snapshot's string fields point to the
-		// canonical instances shared with prior flushes. Partials are skipped by
-		// the cache filter (they are transient, replaced by the next push).
-		messageCache.intern(incoming)
+		// Canonicalize BEFORE publishing: string fields re-bind to the shared
+		// instances and every element maps back to the registered reference for
+		// its ts. A full-state re-post with unchanged content comes back
+		// element-wise equal to the current snapshot → nothing to publish.
+		const canonical = messageRegistry.internList(incoming)
+		// The seq advances even when dedup collapses the post to a no-op: the
+		// guard must still reflect the post that was just seen.
 		seq = incomingSeq
-		setMessages(incoming)
+		if (sameElements(canonical, messages)) {
+			return
+		}
+		setMessages(canonical)
 	}
 
 	const applyUpdates = (updates: ClineMessage | ClineMessage[]) => {
@@ -413,19 +419,28 @@ export const createClineMessagesStore = (): ClineMessagesStore => {
 		}
 		let next: ClineMessage[] | undefined
 		for (const update of batch) {
-			messageCache.intern(update)
-			const lastIndex = findLastIndex(messages, (msg) => msg.ts === update.ts)
+			// Interning + canonical reference in one step: an identical-content
+			// duplicate maps back to the instance already in the snapshot (the
+			// `working[lastIndex] === canonical` check below then skips it),
+			// while a genuinely changed same-ts payload (partial text growth,
+			// isAnswered, api-cost) is adopted as the new canonical.
+			const canonical = messageRegistry.intern(update)
+			const lastIndex = findLastIndex(messages, (msg) => msg.ts === canonical.ts)
 			if (lastIndex !== -1) {
 				const working = next ?? messages
+				if (working[lastIndex] === canonical) {
+					// Duplicate update — the snapshot already carries it.
+					continue
+				}
 				const replaced = working.slice()
-				replaced[lastIndex] = update
+				replaced[lastIndex] = canonical
 				next = replaced
 			} else {
 				// Unknown ts: append instead of dropping. With the seq guard and
 				// cloud event isolation this should not happen under normal
 				// conditions, but appending is the convergent behavior — a later
 				// full-state push still reconciles the array.
-				next = [...(next ?? messages), update]
+				next = [...(next ?? messages), canonical]
 			}
 		}
 		if (next !== undefined) {
@@ -434,7 +449,9 @@ export const createClineMessagesStore = (): ClineMessagesStore => {
 	}
 
 	const clear = () => {
-		messageCache.clear()
+		// Drops the canonical references AND the interned strings (the registry
+		// owns the StringCache).
+		messageRegistry.clear()
 		seq = undefined
 		// Reset derived to initial even when the snapshot was already empty
 		// (setMessages would short-circuit on the reference check).
@@ -507,7 +524,7 @@ export const createClineMessagesStore = (): ClineMessagesStore => {
 		getSeq: () => seq,
 		start,
 		stop,
-		getCacheSize: () => messageCache.size,
+		getCacheSize: () => messageRegistry.stringCacheSize,
 	}
 }
 

@@ -41,8 +41,30 @@ describe("ClineMessagesStore", () => {
 			const fresh = [makeMessage(1, "new")]
 			store.replaceAll(fresh)
 
-			expect(store.getSnapshot()).toBe(fresh)
 			expect(store.getSnapshot()).toHaveLength(1)
+			expect(store.getSnapshot()[0]?.text).toBe("new")
+		})
+
+		it("keeps canonical element references across identical-content re-posts", () => {
+			store.replaceAll([makeMessage(1, "a"), makeMessage(2, "b")])
+			const canonical = store.getSnapshot()
+
+			// A structured-clone twin of the same content: every element maps back
+			// to the registered canonical, and the snapshot keeps its reference.
+			store.replaceAll([makeMessage(1, "a"), makeMessage(2, "b")])
+			expect(store.getSnapshot()).toBe(canonical)
+			expect(store.getSnapshot()[0]).toBe(canonical[0])
+
+			// Genuinely changed content is adopted as the new canonical element...
+			store.replaceAll([makeMessage(1, "a"), makeMessage(2, "b2")])
+			const grown = store.getSnapshot()
+			expect(grown).not.toBe(canonical)
+			expect(grown[0]).toBe(canonical[0]) // unchanged element keeps its reference
+			expect(grown[1]?.text).toBe("b2")
+
+			// ...and a later twin of THAT post maps back to the adopted instance.
+			store.replaceAll([makeMessage(1, "a"), makeMessage(2, "b2")])
+			expect(store.getSnapshot()).toBe(grown)
 		})
 
 		it("applies the seq guard: rejects seq <= stored seq", () => {
@@ -118,6 +140,29 @@ describe("ClineMessagesStore", () => {
 			store.applyUpdates([])
 			expect(store.getSnapshot()).toBe(messages)
 		})
+
+		it("suppresses an identical-content duplicate update (canonical mapping)", () => {
+			const listener = vi.fn()
+			store.replaceAll([makeMessage(1, "a")])
+			store.subscribe(listener)
+
+			// The same ts + same content arriving as a fresh object maps back to
+			// the canonical element already in the snapshot → no publish.
+			store.applyUpdates(makeMessage(1, "a"))
+			expect(listener).not.toHaveBeenCalled()
+			expect(store.getSnapshot()[0]?.text).toBe("a")
+		})
+
+		it("partial growth is never deduplicated (fresh content always adopted)", () => {
+			store.applyUpdates(makeMessage(1, "hel", true))
+			const firstPartial = store.getSnapshot()[0]
+
+			// Same ts, same partial flag, grown text: a different object every
+			// time, and the partial fast path adopts it without a deep compare.
+			store.applyUpdates(makeMessage(1, "hello", true))
+			expect(store.getSnapshot()[0]).not.toBe(firstPartial)
+			expect(store.getSnapshot()[0]?.text).toBe("hello")
+		})
 	})
 
 	describe("interning", () => {
@@ -184,20 +229,30 @@ describe("ClineMessagesStore", () => {
 			const listener = vi.fn()
 			store.subscribe(listener)
 
-			// replaceAll with the exact same array reference is a no-op.
 			const messages = [makeMessage(1, "a")]
 			store.replaceAll(messages)
 			expect(listener).toHaveBeenCalledTimes(1)
 
-			// Same ts with identical content still replaces the element, so the
-			// array reference changes — that IS a notify. To prove skip-notify we
-			// re-replace with the identical reference.
+			// Structured-clone re-post: fresh array, same content. The registry
+			// maps every element back to its canonical → element-wise equal to the
+			// snapshot → nothing to publish.
+			store.replaceAll([makeMessage(1, "a")])
+			expect(listener).toHaveBeenCalledTimes(1)
+
+			// The exact same array reference is likewise a no-op.
 			store.replaceAll(messages)
 			expect(listener).toHaveBeenCalledTimes(1)
 
-			// A stale seq push must not notify either.
-			store.replaceAll([makeMessage(1, "a")], 10)
+			// Genuine content change DOES notify...
+			store.replaceAll([makeMessage(1, "a-changed")], 10)
 			expect(listener).toHaveBeenCalledTimes(2)
+
+			// ...an identical-content re-post with a fresh seq passes the guard but
+			// the registry collapses it back to the snapshot → still quiet.
+			store.replaceAll([makeMessage(1, "a-changed")], 11)
+			expect(listener).toHaveBeenCalledTimes(2)
+
+			// ...while a stale seq push must not, even with new content.
 			store.replaceAll([makeMessage(2, "b")], 5)
 			expect(listener).toHaveBeenCalledTimes(2)
 		})
@@ -355,19 +410,21 @@ describe("ClineMessagesStore", () => {
 			expect(derived.latestTodos).toEqual([])
 		})
 
-		it("keeps the whole slice reference stable for an identical replaceAll (all-fields Object.is)", () => {
+		it("identical replaceAll re-post keeps snapshot AND derived untouched (dedup skip-notify)", () => {
 			const messages = [makeMessage(1, "a"), makeMessage(2, "b")]
 			store.replaceAll(messages)
+			const snapshot = store.getSnapshot()
 			const first = store.getDerived()
 
-			// A new ARRAY carrying the same message references changes the
-			// snapshot (notify fires) but not a single derived field → the
-			// slice object itself is reused.
+			// With the canonical registry the old "fresh array, same elements"
+			// shape can no longer reach setMessages: an identical-content re-post
+			// maps back element-wise and the whole publish is skipped.
 			const listener = vi.fn()
 			store.subscribe(listener)
-			store.replaceAll([...messages])
+			store.replaceAll([makeMessage(1, "a"), makeMessage(2, "b")])
 
-			expect(listener).toHaveBeenCalledTimes(1)
+			expect(listener).not.toHaveBeenCalled()
+			expect(store.getSnapshot()).toBe(snapshot)
 			expect(store.getDerived()).toBe(first)
 		})
 
@@ -475,13 +532,19 @@ describe("ClineMessagesStore", () => {
 	})
 
 	describe("clear", () => {
-		it("drops messages, seq and interned strings", () => {
+		it("drops messages, seq, interned strings and canonical references", () => {
 			store.replaceAll([makeMessage(1, "text")], 7)
+			const before = store.getSnapshot()[0]
 			store.clear()
 
 			expect(store.getSnapshot()).toEqual([])
 			expect(store.getSeq()).toBeUndefined()
 			expect(store.getCacheSize()).toBe(0)
+
+			// The registry was reset too: an identical-content re-post is now
+			// adopted as a NEW canonical instead of mapping back to `before`.
+			store.replaceAll([makeMessage(1, "text")])
+			expect(store.getSnapshot()[0]).not.toBe(before)
 		})
 	})
 })
