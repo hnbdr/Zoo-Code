@@ -16,7 +16,8 @@ import { formatLargeNumber } from "@src/utils/format"
 import { cn } from "@src/lib/utils"
 import { StandardTooltip, Button, Table, TableBody, TableRow, TableCell, CircularProgress } from "@src/components/ui"
 import { useExtensionState } from "@src/context/ExtensionStateContext"
-import { useClineMessagesSelector } from "@src/hooks/useClineMessages"
+import { clineMessagesStore } from "@src/context/stores/clineMessagesStore"
+import { taskHistoryStore } from "@src/context/stores/taskHistoryStore"
 import { useSelectedModel } from "@/components/ui/hooks/useSelectedModel"
 import { vscode } from "@src/utils/vscode"
 
@@ -59,11 +60,12 @@ const TaskHeader = ({
 	todos,
 }: TaskHeaderProps) => {
 	const { t } = useTranslation()
-	const { apiConfiguration, currentTaskItem } = useExtensionState()
-	// Task text: the first message, read from the store via a selector. The
-	// store canonicalizes messages by ts (dedupRegistry), keeping the at(0)
-	// reference stable across identical-content full-state posts.
-	const task = useClineMessagesSelector((messages) => messages.at(0))
+	const { apiConfiguration } = useExtensionState()
+	// Task text: the first message, read from the store via a field selector.
+	// The store keeps `task` (messages.at(0)) reference-stable across
+	// identical-content full-state posts (canonicalization in dedupRegistry).
+	const [task] = clineMessagesStore.useSelector("task")
+	const [currentTaskItem] = taskHistoryStore.useSelector("currentTaskItem")
 	const { id: modelId, info: model } = useSelectedModel(apiConfiguration)
 	const [isTaskExpanded, setIsTaskExpanded] = useState(false)
 

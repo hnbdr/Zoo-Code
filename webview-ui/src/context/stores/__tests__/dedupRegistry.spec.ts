@@ -1,3 +1,5 @@
+import equal from "fast-deep-equal"
+
 import { CanonicalRegistry, sameElements } from "../dedupRegistry"
 
 /** Minimal entity mirroring the store payloads: keyed by `id`, interned text. */
@@ -51,8 +53,7 @@ describe("CanonicalRegistry", () => {
 			// Mirrors the ClineMessagesStore wiring: a partial update is fresh
 			// content by definition and must never map back to the canonical.
 			const registry = new CanonicalRegistry<Entity>((entity) => entity.id, {
-				contentEquals: (incoming, canonical) =>
-					incoming.partial !== true && JSON.stringify(incoming) === JSON.stringify(canonical),
+				contentEquals: (incoming, canonical) => incoming.partial !== true && equal(incoming, canonical),
 			})
 			const final = registry.intern(makeEntity(1, "a"))
 			const partialTwin = makeEntity(1, "a", true)

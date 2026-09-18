@@ -3,6 +3,7 @@
 import { render, screen, fireEvent } from "@/utils/test-utils"
 import { providerIdentifiers } from "@roo-code/types"
 
+import { clineMessagesStore } from "@src/context/stores/clineMessagesStore"
 import TaskHeader from "@src/components/chat/TaskHeader"
 
 // Mock formatLargeNumber function
@@ -42,11 +43,18 @@ vi.mock("@src/components/ui/hooks/useSelectedModel", () => ({
 }))
 
 describe("ContextWindowProgress", () => {
+	// TaskHeader reads the task row through clineMessagesStore.useSelector("task")
+	// now, so every test hydrates the store singleton with the "Test task" row
+	// the assertions click on.
+	beforeEach(() => {
+		vi.clearAllMocks()
+		clineMessagesStore.clear()
+		clineMessagesStore.replaceAll([{ type: "say", say: "task", ts: 1, text: "Test task" } as any])
+	})
+
 	// Helper function to render just the ContextWindowProgress part through TaskHeader
 	const renderComponent = (props: Record<string, any>) => {
-		// Create a simple mock of the task that avoids importing the actual types
 		const defaultProps = {
-			task: { ts: Date.now(), type: "say" as const, say: "text" as const, text: "Test task" },
 			tokensIn: 100,
 			tokensOut: 50,
 			totalCost: 0.001,
@@ -58,8 +66,6 @@ describe("ContextWindowProgress", () => {
 
 		return render(<TaskHeader {...defaultProps} {...props} />)
 	}
-
-	beforeEach(() => vi.clearAllMocks())
 
 	it("renders correctly with valid inputs", () => {
 		renderComponent({ contextTokens: 1000, contextWindow: 4000 })

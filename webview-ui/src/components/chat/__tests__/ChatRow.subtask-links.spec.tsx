@@ -1,5 +1,7 @@
 import React from "react"
 import { render, screen, fireEvent } from "@/utils/test-utils"
+import { clineMessagesStore } from "@src/context/stores/clineMessagesStore"
+import { taskHistoryStore } from "@src/context/stores/taskHistoryStore"
 import { ChatRowContent } from "../ChatRow"
 import type { HistoryItem, ClineMessage } from "@roo-code/types"
 
@@ -52,6 +54,16 @@ vi.mock("@src/components/ui/hooks/useSelectedModel", () => ({
 function renderChatRow(message: any, currentTaskItem?: Partial<HistoryItem>, clineMessages?: ClineMessage[]) {
 	mockCurrentTaskItem = currentTaskItem
 	mockClineMessages = clineMessages || [message]
+
+	// ChatRowContent reads the message stream through the real
+	// clineMessagesStore.useSelector("messages") now, so hydrate the singleton
+	// instead of relying on the mocked extension state's clineMessages field.
+	clineMessagesStore.clear()
+	clineMessagesStore.replaceAll(mockClineMessages as ClineMessage[])
+	// Same for `currentTaskItem`: ChatRow selects it from the taskHistoryStore
+	// singleton (the field left ExtensionStateContext), so seed it there.
+	taskHistoryStore.clear()
+	taskHistoryStore.hydrate({ currentTaskItem: currentTaskItem as HistoryItem | undefined })
 
 	return render(
 		<ChatRowContent

@@ -8,7 +8,7 @@ import { isBoundary, isIgnorableBetweenTargets } from "@src/utils/chatBatchingPr
 import type { ClineAsk, ClineMessage, SuggestionItem } from "@roo-code/types"
 
 import { vscode } from "@src/utils/vscode"
-import { useClineMessages, useMessageDerived } from "@src/hooks/useClineMessages"
+import { clineMessagesStore } from "@src/context/stores/clineMessagesStore"
 import type { ScrollFollowDisengageSource } from "@src/hooks/useScrollLifecycle"
 import ChatRow from "./ChatRow"
 import FileChangesPanel from "./FileChangesPanel"
@@ -26,10 +26,11 @@ const CHAT_VIEWPORT_BUFFER = {
 
 /**
  * MessageStream is the pure render pipeline: it consumes the store snapshot
- * (raw, per flush — the row pipeline must see every text growth) plus the
- * store's derived slice (boundary facts, computed once per flush inside the
- * store). Everything the shell needs to react to lives in the derived slice
- * and reaches it through the useMessageDerived* hooks, not an uplink.
+ * fields (raw messages per flush — the row pipeline must see every text
+ * growth — plus the store's derived fields, computed once per flush inside
+ * the store) through `clineMessagesStore.useSelector`. Everything the shell
+ * needs to react to lives in the snapshot and reaches it through selectors,
+ * not an uplink.
  *
  * The single remaining uplink is onCheckpointIndicesChange: checkpoint row
  * indices are derived from the GROUPED (view-processed) array, which cannot be
@@ -77,14 +78,19 @@ const MessageStream = memo(function MessageStream({
 	onJumpToPreviousCheckpoint,
 	onCheckpointIndicesChange,
 }: MessageStreamProps) {
-	const messages = useClineMessages()
-
-	// Boundary facts + the collapsed row stream, computed once inside the store
-	// per real snapshot change. MessageStream re-renders per flush anyway
-	// (raw-snapshot subscription), so taking the whole slice here is free.
-	const derived = useMessageDerived()
-	const task = derived.task
-	const modifiedMessages = derived.modifiedMessages
+	// The raw message array is selected with the row-pipeline fields: the
+	// render pipeline must observe every partial-text growth, so `messages` /
+	// `modifiedMessages` change reference per flush and this component
+	// re-renders with them. The boundary facts are selected in the same call
+	// — MessageStream re-renders per flush anyway, so listing them here is
+	// free (they ride on the already-scheduled render).
+	const [messages, task, modifiedMessages, completionCheckpoint, completionResultTs] = clineMessagesStore.useSelector(
+		"messages",
+		"task",
+		"modifiedMessages",
+		"completionCheckpoint",
+		"completionResultTs",
+	)
 
 	// Rows remember their expanded state across flushes; reset on task change.
 	const [expandedRows, setExpandedRows] = useState<Record<number, boolean>>({})
@@ -468,10 +474,6 @@ const MessageStream = memo(function MessageStream({
 	const handleFollowUpUnmount = useCallback(() => {
 		vscode.postMessage({ type: "cancelAutoApproval" })
 	}, [])
-
-	// Row-render inputs come from the store's derived slice — the same values
-	// the shell reads, computed once per flush instead of a second time here.
-	const { completionCheckpoint, completionResultTs } = derived
 
 	// ===== REMOUNT POINT #3 (message list) =====
 	// computeMessageKey drives React reconciliation: whenever a message's ts or

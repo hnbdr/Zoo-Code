@@ -46,4 +46,16 @@ export default [
 			"no-undef": "off",
 		},
 	},
+	{
+		// StoreBase.useSelector is a genuine custom hook implemented as a
+		// store method (the hook contract is per-call-site, like Zustand's
+		// UseBoundStore). react-hooks/rules-of-hooks cannot model "a method
+		// named use* on a non-component object is a custom hook" and flags
+		// every useRef/useCallback/useSyncExternalStore call inside the class
+		// body, so the rule is scoped off for this one file.
+		files: ["src/context/stores/storeBase.ts"],
+		rules: {
+			"react-hooks/rules-of-hooks": "off",
+		},
+	},
 ]

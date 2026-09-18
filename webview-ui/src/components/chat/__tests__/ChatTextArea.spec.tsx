@@ -46,7 +46,10 @@ const hydrateStores = (
 	clineMessagesStore.clear()
 	clineMessagesStore.replaceAll(clineMessages)
 	taskHistoryStore.clear()
-	taskHistoryStore.replaceAll(taskHistory)
+	// `taskHistoryPrompts` derives only once the store knows the workspace (the
+	// extension posts `cwd` with every state message), so hydrate with both the
+	// list and the same `/test/workspace` the context mock carries.
+	taskHistoryStore.hydrate({ cwd: "/test/workspace", taskHistory })
 }
 
 // HistoryItem factory for the prompt-history fallback: task + workspace drive

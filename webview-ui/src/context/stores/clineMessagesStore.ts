@@ -7,13 +7,20 @@ import {
 	getCompletionCheckpoint,
 } from "@roo-code/types"
 
+import equal from "fast-deep-equal"
+
 import { findLastIndex } from "@roo/array"
 import { combineApiRequests } from "@roo/combineApiRequests"
 import { combineCommandSequences } from "@roo/combineCommandSequences"
 import { getApiMetrics, hasTokenUsageChanged } from "@roo/getApiMetrics"
 import { getLatestTodo } from "@roo/todo"
 
+import type { FileChangeEntry } from "../../components/chat/utils/fileChangesFromMessages"
+import { fileChangesFromMessages } from "../../components/chat/utils/fileChangesFromMessages"
+
+import { StoreBase } from "./storeBase"
 import { CanonicalRegistry, sameElements } from "./dedupRegistry"
+import { extractConversationPrompts } from "./promptHistory"
 
 /**
  * ClineMessagesStore — the frontend slice that owns the task's `clineMessages`
@@ -26,10 +33,11 @@ import { CanonicalRegistry, sameElements } from "./dedupRegistry"
  *
  * This store moves `clineMessages` out of the context state and exposes a
  * useSyncExternalStore-shaped snapshot so only components that subscribe to the
- * store re-render when messages change. It is deliberately written in the
- * factory form that Commit 3 generalizes into `createSliceStore` (see §7.3 of
- * the plan): the domain reducer lives here, in concrete form, and the generic
- * slice factory later reuses the same shape.
+ * store re-render when messages change. It extends `StoreBase`, whose
+ * `useSelector(...keys)` hook gives consumers per-field subscriptions: the
+ * snapshot is a record carrying the raw `messages` plus every derived field,
+ * and a subscriber re-renders only when one of the fields it selected changes
+ * reference.
  *
  * The store is STORE-shaped, not bus-shaped (§7.3): messages are state, not
  * events. The stream consumer hands Virtuoso the whole array and needs a
@@ -73,12 +81,14 @@ export interface LastMessageFlags {
 }
 
 /**
- * Derived data slice of the store (plans/derived-store-revision.md §2.1).
+ * Derived data slice of the store (plans/derived-store-revision.md §2.1),
+ * merged into the published snapshot next to the raw `messages`.
  *
- * Every field is a pure function of the message snapshot, recomputed exactly
- * once per real snapshot change inside `setMessages` — consumers (the ChatView
- * shell, MessageStream rows) never recompute these themselves. Field identity
- * is stabilized so subscribers only re-render on boundary events:
+ * Every field is a pure function of the message array, recomputed exactly
+ * once per real snapshot change inside `setMessages`. Field identity is
+ * stabilized so `useSelector` subscribers only re-render on boundary events
+ * (the selector compares selected fields by reference; unchanged fields keep
+ * their previous instance here):
  *
  * - `lastMessage` is swapped only when its boundary key
  *   (`ts|type|say|ask|partial|isAnswered`) changes — text growth inside a
@@ -86,23 +96,30 @@ export interface LastMessageFlags {
  *   signature semantics 1-1.
  * - `apiMetrics` keeps the previous reference while `hasTokenUsageChanged`
  *   reports no difference.
- * - `latestTodos` keeps the previous reference while the JSON signature is
- *   equal (`getLatestTodo` allocates a fresh array on every parse).
- * - `completionCheckpoint` keeps the previous reference while `ts|commitHash`
- *   is equal.
+ * - `latestTodos` keeps the previous reference while the value is deep-equal
+ *   (`getLatestTodo` allocates a fresh array on every parse).
+ * - `completionCheckpoint` keeps the previous reference while deep-equal
+ *   (`ts` + `commitHash`).
  * - Primitives are `Object.is` stable on their own.
  * - `modifiedMessages` is deliberately NOT boundary-stabilized: the row render
- *   pipeline must observe every partial-text growth. Only the empty case keeps
- *   the previous reference (task-switch / clear noise collapse).
- *
- * The slice object itself is recreated only when at least one field changed
- * reference; `clear()` resets it to the initial (empty-snapshot) value.
+ *   pipeline must observe every partial-text growth. The collapsed stream is
+ *   kept by deep value equality — the `combine*` steps allocate fresh objects
+ *   on every run, so a re-derived identical stream keeps the previous
+ *   reference (task-switch / clear noise collapse).
+ * - `conversationPrompts` (user_feedback texts, newest first, for prompt
+ *   history navigation) keeps the previous reference while the extracted
+ *   strings are equal, so ChatTextArea's `useSelector` ignores every
+ *   streaming-text flush that does not add a user message.
  */
 export interface DerivedMessageState {
 	task: ClineMessage | undefined
 	lastMessage: ClineMessage | undefined
 	count: number
 	modifiedMessages: ClineMessage[]
+	fileChanges: FileChangeEntry[]
+	fileChangesByPath: Map<string, FileChangeEntry[]>
+	fileChangesTotalStats: { added: number; removed: number }
+	conversationPrompts: string[] | undefined
 	lastIsAsk: boolean
 	lastIsPartial: boolean
 	hasOpenApiRequest: boolean
@@ -114,6 +131,16 @@ export interface DerivedMessageState {
 	latestTodos: TodoItem[]
 }
 
+/**
+ * The published snapshot: the raw message array plus every derived field.
+ * The record object is recreated on each publish; subscribers never depend on
+ * its identity — `useSelector` compares the SELECTED fields' references, so
+ * only real field moves re-render.
+ */
+export interface ClineMessagesSnapshot extends DerivedMessageState {
+	messages: ClineMessage[]
+}
+
 const EMPTY_TOKEN_USAGE: TokenUsage = {
 	totalTokensIn: 0,
 	totalTokensOut: 0,
@@ -121,6 +148,26 @@ const EMPTY_TOKEN_USAGE: TokenUsage = {
 	totalCacheReads: undefined,
 	totalCost: 0,
 	contextTokens: 0,
+}
+const getFileChangesByPath = (fileChanges: FileChangeEntry[]): Map<string, FileChangeEntry[]> => {
+	const map = new Map<string, FileChangeEntry[]>()
+	for (const entry of fileChanges) {
+		const key = entry.path
+		const list = map.get(key) ?? []
+		list.push(entry)
+		map.set(key, list)
+	}
+	return map
+}
+
+const getFileChangesTotalStats = (fileChanges: FileChangeEntry[]): { added: number; removed: number } => {
+	return fileChanges.reduce(
+		(acc, e) => ({
+			added: acc.added + (e.diffStats?.added ?? 0),
+			removed: acc.removed + (e.diffStats?.removed ?? 0),
+		}),
+		{ added: 0, removed: 0 },
+	)
 }
 
 /**
@@ -132,12 +179,6 @@ const messageBoundaryKey = (message: ClineMessage | undefined): string | undefin
 	message === undefined
 		? undefined
 		: `${message.ts}|${message.type}|${message.say ?? ""}|${message.ask ?? ""}|${message.partial === true}|${message.isAnswered === true}`
-
-const lastMessageFlagsEqual = (a: LastMessageFlags, b: LastMessageFlags): boolean =>
-	a.lastIsAsk === b.lastIsAsk && a.lastIsPartial === b.lastIsPartial && a.hasOpenApiRequest === b.hasOpenApiRequest
-
-const completionCheckpointEqual = (a: CompletionCheckpoint | undefined, b: CompletionCheckpoint | undefined): boolean =>
-	a === b || (!!a && !!b && a.ts === b.ts && a.commitHash === b.commitHash)
 
 /**
  * Scans backwards for the ts of the last completion-result row: a `say`, or an
@@ -162,6 +203,10 @@ const initialDerived: DerivedMessageState = {
 	lastMessage: undefined,
 	count: 0,
 	modifiedMessages: [],
+	fileChanges: [],
+	fileChangesByPath: new Map(),
+	fileChangesTotalStats: { added: 0, removed: 0 },
+	conversationPrompts: undefined,
 	lastIsAsk: false,
 	lastIsPartial: false,
 	hasOpenApiRequest: false,
@@ -171,62 +216,6 @@ const initialDerived: DerivedMessageState = {
 	completionCheckpoint: undefined,
 	apiMetrics: EMPTY_TOKEN_USAGE,
 	latestTodos: [],
-}
-
-export interface ClineMessagesStore {
-	/** useSyncExternalStore contract: current immutable snapshot. */
-	getSnapshot: () => ClineMessage[]
-	/** useSyncExternalStore contract: returns an unsubscribe function. */
-	subscribe: (listener: () => void) => () => void
-
-	/**
-	 * Current derived slice (immutable: per-flush new object or the previous
-	 * one, never mutated after publication). Recomputed inside `setMessages`
-	 * exactly once per real snapshot change and reset by `clear()`.
-	 */
-	getDerived: () => DerivedMessageState
-
-	/**
-	 * Full-state hydration (a `{type:"state"}` post). Applies the seq guard:
-	 * when both the incoming and the stored seq are defined and the incoming is
-	 * NOT strictly greater, the new messages are ignored (a stale push must not
-	 * overwrite newer ones). Canonicalizes the array (string interning + one
-	 * reference per `ts`) before publishing; a re-post whose every element maps
-	 * back to the current snapshot publishes nothing (skip-notify).
-	 */
-	replaceAll: (messages: ClineMessage[], seq?: number) => void
-
-	/**
-	 * Streaming update — `{type:"messageUpdated", clineMessage}` (single) or a
-	 * batch (Commit 1's `messagesUpdated` shape). Last-write-wins by `ts`;
-	 * unknown `ts` values are appended (state sync issue, no longer silently
-	 * dropped). Each update passes through the registry: an identical-content
-	 * duplicate publishes nothing, a genuinely changed same-ts payload is
-	 * adopted as the new canonical.
-	 */
-	applyUpdates: (updates: ClineMessage | ClineMessage[]) => void
-
-	/**
-	 * Drop messages, seq and the interned strings. The whole old ChatView tree
-	 * is unmounted at this point (`key={currentTaskId}` in App.tsx), so nothing
-	 * references the cached strings anymore.
-	 */
-	clear: () => void
-
-	/** Last applied sequence number (undefined when no seq has been seen). */
-	getSeq: () => number | undefined
-
-	/**
-	 * Attaches the self-hydrating window "message" listener. Idempotent.
-	 * Call from the provider's mount effect; detach with `stop()` on unmount.
-	 */
-	start: () => void
-
-	/** Detaches the self-hydrating window "message" listener. Idempotent. */
-	stop: () => void
-
-	/** Test-only: number of interned strings (StringCache.size). */
-	getCacheSize: () => number
 }
 
 const isMessagesUpdated = (
@@ -240,44 +229,41 @@ const isSingleMessageUpdated = (
 	message.type === "messageUpdated" && message.clineMessage !== undefined
 
 /**
- * Factory form (generalized by `createSliceStore` in Commit 3). Each instance
- * owns its own messages, seq, listener set and task-scoped canonical registry
- * (string interning included), so tests can construct isolated stores without
- * cross-test leakage.
+ * Each instance owns its messages, listener set and task-scoped canonical
+ * registry (string interning included), so tests can construct isolated
+ * stores without cross-test leakage.
  */
-export const createClineMessagesStore = (): ClineMessagesStore => {
-	let messages: ClineMessage[] = []
-	let derived: DerivedMessageState = initialDerived
-	let seq: number | undefined
-	const listeners = new Set<() => void>()
+export class ClineMessagesStore extends StoreBase<ClineMessagesSnapshot> {
+	private messages: ClineMessage[] = []
+	private derived: DerivedMessageState = initialDerived
+	private snapshot: ClineMessagesSnapshot = { ...initialDerived, messages: [] }
+	private seq: number | undefined
 	// Canonical instance per `ts`; the registry owns the string interning (its
 	// filter skips partial messages). The `partial` fast path below keeps the
-	// streaming hot path from ever paying the JSON.stringify comparison: a
-	// partial is fresh content by definition, so it is always adopted.
-	const messageRegistry = new CanonicalRegistry<ClineMessage>((msg) => msg.ts, {
+	// streaming hot path from ever paying the deep comparison: a partial is
+	// fresh content by definition, so it is always adopted.
+	private readonly messageRegistry = new CanonicalRegistry<ClineMessage>((msg) => msg.ts, {
 		shouldInternString: (msg) => !msg.partial,
-		contentEquals: (incoming, canonical) =>
-			incoming.partial !== true && JSON.stringify(incoming) === JSON.stringify(canonical),
+		contentEquals: (incoming, canonical) => incoming.partial !== true && equal(incoming, canonical),
 	})
-	let started = false
+	private started = false
 	// Last task id observed in a `{type:"state"}` post. A change means the old
 	// ChatView tree (key={currentTaskId} in App.tsx) has been unmounted and the
 	// previous task's messages + interned strings are unreachable → clear.
-	let lastTaskId: string | undefined
+	private lastTaskId: string | undefined
 
-	const notify = () => {
-		for (const listener of listeners) {
-			listener()
-		}
+	/** useSyncExternalStore contract: current immutable snapshot record. */
+	getSnapshot(): ClineMessagesSnapshot {
+		return this.snapshot
 	}
 
 	/**
-	 * Recomputes the derived slice for `msgs`, reusing `prev` field references
+	 * Recomputes the derived fields for `msgs`, reusing `prev` field references
 	 * wherever the identity rules documented on DerivedMessageState say the
 	 * value has not effectively changed. Pure function of (prev, msgs) — no
 	 * subscriptions, no window access (self-hydration stays snapshot-only).
 	 */
-	const derive = (prev: DerivedMessageState, msgs: ClineMessage[]): DerivedMessageState => {
+	private derive(prev: DerivedMessageState, msgs: ClineMessage[]): DerivedMessageState {
 		const task = msgs.at(0)
 
 		// lastMessage: only a boundary-key change swaps the reference, so the
@@ -291,11 +277,12 @@ export const createClineMessagesStore = (): ClineMessagesStore => {
 
 		// The collapsed row stream (API request + command sequences merged into
 		// their initiating row). NOT boundary-stabilized on purpose: the render
-		// pipeline must observe every partial-text growth. Element-wise identity
-		// reuse keeps the array reference (and so the whole slice) stable when
-		// an identical snapshot is re-published.
+		// pipeline must observe every partial-text growth. Deep value equality
+		// keeps the array reference stable when an identical snapshot is
+		// re-published: the combine* steps always allocate fresh objects, so
+		// element-wise identity (sameElements) could never hold here.
 		const modifiedCandidate = combineApiRequests(combineCommandSequences(msgs.slice(1)))
-		const modifiedMessages = sameElements(modifiedCandidate, prev.modifiedMessages)
+		const modifiedMessages = equal(modifiedCandidate, prev.modifiedMessages)
 			? prev.modifiedMessages
 			: modifiedCandidate
 
@@ -321,7 +308,10 @@ export const createClineMessagesStore = (): ClineMessagesStore => {
 			})()
 		)
 
-		const lastMessageFlags: LastMessageFlags = { lastIsAsk, lastIsPartial, hasOpenApiRequest }
+		const lastMessageFlagsCandidate: LastMessageFlags = { lastIsAsk, lastIsPartial, hasOpenApiRequest }
+		const lastMessageFlags = equal(prev.lastMessageFlags, lastMessageFlagsCandidate)
+			? prev.lastMessageFlags
+			: lastMessageFlagsCandidate
 
 		const apiMetricsCandidate = getApiMetrics(modifiedMessages)
 		const apiMetrics = hasTokenUsageChanged(apiMetricsCandidate, prev.apiMetrics)
@@ -329,23 +319,41 @@ export const createClineMessagesStore = (): ClineMessagesStore => {
 			: prev.apiMetrics
 
 		// getLatestTodo parses the whole history into a fresh array on every
-		// call — JSON signature equality is the only way to keep identity.
+		// call — deep value equality is the only way to keep identity.
 		const latestTodosCandidate = getLatestTodo(msgs) as TodoItem[]
-		const latestTodos =
-			JSON.stringify(latestTodosCandidate) === JSON.stringify(prev.latestTodos)
-				? prev.latestTodos
-				: latestTodosCandidate
+		const latestTodos = equal(latestTodosCandidate, prev.latestTodos) ? prev.latestTodos : latestTodosCandidate
 
 		const completionCheckpointCandidate = getCompletionCheckpoint(msgs)
-		const completionCheckpoint = completionCheckpointEqual(completionCheckpointCandidate, prev.completionCheckpoint)
+		const completionCheckpoint = equal(completionCheckpointCandidate, prev.completionCheckpoint)
 			? prev.completionCheckpoint
 			: completionCheckpointCandidate
 
-		const next: DerivedMessageState = {
+		// Prompt-history source for usePromptHistory: extraction is cheap but
+		// the REFERENCE matters — subscribers re-render on identity change, so
+		// keep the previous list while the strings are equal (`equal` also
+		// handles the undefined ↔ [] boundary: only two undefined values match).
+		const conversationPromptsCandidate = extractConversationPrompts(msgs)
+		const conversationPrompts = equal(conversationPromptsCandidate, prev.conversationPrompts)
+			? prev.conversationPrompts
+			: conversationPromptsCandidate
+
+		const fileChangesCandidate = fileChangesFromMessages(msgs)
+		const fileChanges = equal(fileChangesCandidate, prev.fileChanges) ? prev.fileChanges : fileChangesCandidate
+
+		const fileChangesByPath =
+			fileChanges !== prev.fileChanges ? getFileChangesByPath(fileChanges) : prev.fileChangesByPath
+		const fileChangesTotalStats =
+			fileChanges !== prev.fileChanges ? getFileChangesTotalStats(fileChanges) : prev.fileChangesTotalStats
+
+		return {
 			task,
 			lastMessage,
 			count: msgs.length,
 			modifiedMessages,
+			fileChanges,
+			fileChangesByPath,
+			fileChangesTotalStats,
+			conversationPrompts,
 			lastIsAsk,
 			lastIsPartial,
 			hasOpenApiRequest,
@@ -356,63 +364,63 @@ export const createClineMessagesStore = (): ClineMessagesStore => {
 			apiMetrics,
 			latestTodos,
 		}
-
-		// Whole-slice identity: reuse prev only when EVERY field link is
-		// unchanged, so a "subscribe to the whole slice" consumer re-renders
-		// only when something actually moved.
-		const fieldsUnchanged =
-			next.task === prev.task &&
-			next.lastMessage === prev.lastMessage &&
-			next.count === prev.count &&
-			next.modifiedMessages === prev.modifiedMessages &&
-			next.lastIsAsk === prev.lastIsAsk &&
-			next.lastIsPartial === prev.lastIsPartial &&
-			next.hasOpenApiRequest === prev.hasOpenApiRequest &&
-			lastMessageFlagsEqual(next.lastMessageFlags, prev.lastMessageFlags) &&
-			next.hasCompletionResult === prev.hasCompletionResult &&
-			next.completionResultTs === prev.completionResultTs &&
-			next.completionCheckpoint === prev.completionCheckpoint &&
-			next.apiMetrics === prev.apiMetrics &&
-			next.latestTodos === prev.latestTodos
-		return fieldsUnchanged ? prev : next
 	}
 
-	const setMessages = (next: ClineMessage[]) => {
-		if (next === messages) {
+	private setMessages(next: ClineMessage[]) {
+		if (next === this.messages) {
 			// No reference change — nothing to publish (skip-notify).
 			return
 		}
-		messages = next
-		// Recompute the derived slice exactly once per real snapshot change,
-		// BEFORE notifying so subscribers always observe a derived consistent
-		// with the snapshot they just read.
-		derived = derive(derived, next)
-		notify()
+		this.messages = next
+		// Recompute the derived fields exactly once per real snapshot change,
+		// BEFORE notifying so subscribers always observe derived data
+		// consistent with the snapshot they just read. Field references keep
+		// their identity where the value did not move, so `useSelector`
+		// subscribers ignore the fresh record object.
+		this.derived = this.derive(this.derived, next)
+		this.snapshot = { ...this.derived, messages: next }
+		this.notify()
 	}
 
-	const replaceAll = (incoming: ClineMessage[], incomingSeq?: number) => {
+	/**
+	 * Full-state hydration (a `{type:"state"}` post). Applies the seq guard:
+	 * when both the incoming and the stored seq are defined and the incoming is
+	 * NOT strictly greater, the new messages are ignored (a stale push must not
+	 * overwrite newer ones). Canonicalizes the array (string interning + one
+	 * reference per `ts`) before publishing; a re-post whose every element maps
+	 * back to the current snapshot publishes nothing (skip-notify).
+	 */
+	replaceAll(incoming: ClineMessage[], incomingSeq?: number) {
 		// Seq guard (moved verbatim from mergeExtensionState): only apply
 		// clineMessages when the incoming seq is strictly greater than the last
 		// applied seq. When either side is undefined (backward compat / first
 		// push), always apply.
-		if (incomingSeq !== undefined && seq !== undefined && incomingSeq <= seq) {
+		if (incomingSeq !== undefined && this.seq !== undefined && incomingSeq <= this.seq) {
 			return
 		}
 		// Canonicalize BEFORE publishing: string fields re-bind to the shared
 		// instances and every element maps back to the registered reference for
 		// its ts. A full-state re-post with unchanged content comes back
 		// element-wise equal to the current snapshot → nothing to publish.
-		const canonical = messageRegistry.internList(incoming)
+		const canonical = this.messageRegistry.internList(incoming)
 		// The seq advances even when dedup collapses the post to a no-op: the
 		// guard must still reflect the post that was just seen.
-		seq = incomingSeq
-		if (sameElements(canonical, messages)) {
+		this.seq = incomingSeq
+		if (sameElements(canonical, this.messages)) {
 			return
 		}
-		setMessages(canonical)
+		this.setMessages(canonical)
 	}
 
-	const applyUpdates = (updates: ClineMessage | ClineMessage[]) => {
+	/**
+	 * Streaming update — `{type:"messageUpdated", clineMessage}` (single) or a
+	 * batch (Commit 1's `messagesUpdated` shape). Last-write-wins by `ts`;
+	 * unknown `ts` values are appended (state sync issue, no longer silently
+	 * dropped). Each update passes through the registry: an identical-content
+	 * duplicate publishes nothing, a genuinely changed same-ts payload is
+	 * adopted as the new canonical.
+	 */
+	applyUpdates(updates: ClineMessage | ClineMessage[]) {
 		const batch = Array.isArray(updates) ? updates : [updates]
 		if (batch.length === 0) {
 			return
@@ -424,10 +432,10 @@ export const createClineMessagesStore = (): ClineMessagesStore => {
 			// `working[lastIndex] === canonical` check below then skips it),
 			// while a genuinely changed same-ts payload (partial text growth,
 			// isAnswered, api-cost) is adopted as the new canonical.
-			const canonical = messageRegistry.intern(update)
-			const lastIndex = findLastIndex(messages, (msg) => msg.ts === canonical.ts)
+			const canonical = this.messageRegistry.intern(update)
+			const lastIndex = findLastIndex(this.messages, (msg) => msg.ts === canonical.ts)
 			if (lastIndex !== -1) {
-				const working = next ?? messages
+				const working = next ?? this.messages
 				if (working[lastIndex] === canonical) {
 					// Duplicate update — the snapshot already carries it.
 					continue
@@ -440,93 +448,72 @@ export const createClineMessagesStore = (): ClineMessagesStore => {
 				// cloud event isolation this should not happen under normal
 				// conditions, but appending is the convergent behavior — a later
 				// full-state push still reconciles the array.
-				next = [...(next ?? messages), canonical]
+				next = [...(next ?? this.messages), canonical]
 			}
 		}
 		if (next !== undefined) {
-			setMessages(next)
+			this.setMessages(next)
 		}
 	}
 
-	const clear = () => {
+	/**
+	 * Drop messages, seq and the interned strings. The whole old ChatView tree
+	 * is unmounted at this point (`key={currentTaskId}` in App.tsx), so nothing
+	 * references the cached strings anymore.
+	 */
+	clear(hard = false) {
 		// Drops the canonical references AND the interned strings (the registry
 		// owns the StringCache).
-		messageRegistry.clear()
-		seq = undefined
-		// Reset derived to initial even when the snapshot was already empty
-		// (setMessages would short-circuit on the reference check).
-		derived = initialDerived
-		setMessages([])
+		this.messageRegistry.clear()
+		this.seq = undefined
+		// Reset derived to initial and publish unconditionally: a fresh empty
+		// array re-keys even an already-empty snapshot so subscribers that
+		// hold the previous record observe the reset.
+		this.derived = initialDerived
+		this.messages = []
+		this.snapshot = { ...initialDerived, messages: this.messages }
+		if (hard) {
+			this.lastTaskId = undefined
+		}
+		this.notify()
 	}
 
-	const handleMessage = (event: MessageEvent) => {
-		const message = event.data as ExtensionMessage
-		switch (message.type) {
-			case "state": {
-				const newState = message.state ?? {}
-				// Task switch: the old ChatView tree is unmounted at this point
-				// (key={currentTaskId} in App.tsx), so drop its messages AND its
-				// interned strings before hydrating the new task's. clear() also
-				// resets the seq so the new task starts from an undefined
-				// baseline (its own first full-state post re-establishes it).
-				const newTaskId = newState.currentTaskId
-				if (newTaskId !== undefined && newTaskId !== lastTaskId) {
-					clear()
-					lastTaskId = newTaskId
-				}
-				if (newState.clineMessages !== undefined) {
-					replaceAll(newState.clineMessages, newState.clineMessagesSeq)
-				}
-				break
-			}
-			case "messageUpdated": {
-				if (isMessagesUpdated(message)) {
-					// Commit 1's batched shape (adapter converges here).
-					applyUpdates(message.clineMessages)
-				} else if (isSingleMessageUpdated(message)) {
-					applyUpdates(message.clineMessage)
-				}
-				break
-			}
-			default:
-				break
+	/** Last applied sequence number (undefined when no seq has been seen). */
+	getSeq(): number | undefined {
+		return this.seq
+	}
+
+	public handleState(message: ExtensionMessage) {
+		const newState = message.state ?? {}
+		// Task switch: the old ChatView tree is unmounted at this point
+		// (key={currentTaskId} in App.tsx), so drop its messages AND its
+		// interned strings before hydrating the new task's. clear() also
+		// resets the seq so the new task starts from an undefined
+		// baseline (its own first full-state post re-establishes it).
+		const newTaskId = newState.currentTaskId
+		if (newTaskId !== undefined && newTaskId !== this.lastTaskId) {
+			this.clear()
+			this.lastTaskId = newTaskId
+		}
+		if (newState.clineMessages !== undefined) {
+			this.replaceAll(newState.clineMessages, newState.clineMessagesSeq)
 		}
 	}
 
-	const start = () => {
-		if (started) {
-			return
+	public handleMessageUpdated(message: ExtensionMessage) {
+		if (isMessagesUpdated(message)) {
+			// Commit 1's batched shape (adapter converges here).
+			this.applyUpdates(message.clineMessages)
+		} else if (isSingleMessageUpdated(message)) {
+			this.applyUpdates(message.clineMessage)
 		}
-		started = true
-		window.addEventListener("message", handleMessage)
 	}
 
-	const stop = () => {
-		if (!started) {
-			return
-		}
-		started = false
-		window.removeEventListener("message", handleMessage)
-	}
-
-	return {
-		getSnapshot: () => messages,
-		getDerived: () => derived,
-		subscribe: (listener) => {
-			listeners.add(listener)
-			return () => {
-				listeners.delete(listener)
-			}
-		},
-		replaceAll,
-		applyUpdates,
-		clear,
-		getSeq: () => seq,
-		start,
-		stop,
-		getCacheSize: () => messageRegistry.stringCacheSize,
+	/** Test-only: number of interned strings (StringCache.size). */
+	getCacheSize(): number {
+		return this.messageRegistry.stringCacheSize
 	}
 }
 
 /** Module singleton used by the app (provider mounts start/stop it). */
-export const clineMessagesStore = createClineMessagesStore()
+export const clineMessagesStore = new ClineMessagesStore()

@@ -1,10 +1,19 @@
-import { ClineMessage, HistoryItem } from "@roo-code/types"
 import { useCallback, useEffect, useMemo, useState } from "react"
 
 interface UsePromptHistoryProps {
-	clineMessages: ClineMessage[] | undefined
-	taskHistory: HistoryItem[] | undefined
-	cwd: string | undefined
+	/**
+	 * Conversation prompts (user_feedback texts, newest first) straight from
+	 * `clineMessagesStore.useSelector("conversationPrompts")`. `undefined`
+	 * means there is no active task; an empty array means a task without user
+	 * messages yet (no fallback to the task history in that case).
+	 */
+	conversationPrompts: string[] | undefined
+	/**
+	 * Task-history prompts for the current workspace, from
+	 * `taskHistoryStore.useSelector("taskHistoryPrompts")`. Consumed only when
+	 * there is no active task.
+	 */
+	taskHistoryPrompts: string[]
 	inputValue: string
 	setInputValue: (value: string) => void
 }
@@ -24,50 +33,33 @@ export interface UsePromptHistoryReturn {
 	resetOnInputChange: () => void
 }
 
+/**
+ * ArrowUp/ArrowDown navigation through the prompt history.
+ *
+ * The heavy part — deriving the prompt lists from the message stream and the
+ * task history — lives in the stores, which publish reference-stable values.
+ * This hook therefore only re-derives its source list when a prompt list
+ * actually changes, never while streamed text grows token by token.
+ */
 export const usePromptHistory = ({
-	clineMessages,
-	taskHistory,
-	cwd,
+	conversationPrompts,
+	taskHistoryPrompts,
 	inputValue,
 	setInputValue,
 }: UsePromptHistoryProps): UsePromptHistoryReturn => {
-	// Maximum number of prompts to keep in history for memory management
-	const MAX_PROMPT_HISTORY_SIZE = 100
-
 	// Prompt history navigation state
 	const [historyIndex, setHistoryIndex] = useState(-1)
 	const [tempInput, setTempInput] = useState("")
 	const [promptHistory, setPromptHistory] = useState<string[]>([])
 
-	// Initialize prompt history with hybrid approach: conversation messages if in task, otherwise task history
+	// Hybrid source: conversation prompts while a task is active, task-history
+	// prompts only when starting fresh (no active conversation).
 	const filteredPromptHistory = useMemo(() => {
-		// First try to get conversation messages (user_feedback from clineMessages)
-		const conversationPrompts = clineMessages
-			?.filter((message) => message.type === "say" && message.say === "user_feedback" && message.text?.trim())
-			.map((message) => message.text!)
-
-		// If we have conversation messages, use those (newest first when navigating up)
-		if (conversationPrompts?.length) {
-			return conversationPrompts.slice(-MAX_PROMPT_HISTORY_SIZE).reverse()
+		if (conversationPrompts !== undefined) {
+			return conversationPrompts.length > 0 ? conversationPrompts : []
 		}
-
-		// If we have clineMessages array (meaning we're in an active task), don't fall back to task history
-		// Only use task history when starting fresh (no active conversation)
-		if (clineMessages?.length) {
-			return []
-		}
-
-		// Fall back to task history only when starting fresh (no active conversation)
-		if (!taskHistory?.length || !cwd) {
-			return []
-		}
-
-		// Extract user prompts from task history for the current workspace only
-		return taskHistory
-			.filter((item) => item.task?.trim() && (!item.workspace || item.workspace === cwd))
-			.map((item) => item.task)
-			.slice(0, MAX_PROMPT_HISTORY_SIZE)
-	}, [clineMessages, taskHistory, cwd])
+		return taskHistoryPrompts
+	}, [conversationPrompts, taskHistoryPrompts])
 
 	// Update prompt history when filtered history changes and reset navigation
 	useEffect(() => {

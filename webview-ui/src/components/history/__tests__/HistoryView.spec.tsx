@@ -3,16 +3,13 @@ import { render, screen, fireEvent } from "@/utils/test-utils"
 import { useExtensionState } from "@src/context/ExtensionStateContext"
 
 import HistoryView from "../HistoryView"
-import { useTaskHistory } from "@src/hooks/useTaskHistory"
+import { taskHistoryStore } from "@src/context/stores/taskHistoryStore"
 
 vi.mock("@src/context/ExtensionStateContext")
 vi.mock("@src/utils/vscode")
-// Task 1: taskHistory is read through the useTaskHistory store hook now
-// (HistoryView → useTaskSearch), so the spec drives the hook mock instead of
-// the context's taskHistory field.
-vi.mock("@src/hooks/useTaskHistory", () => ({
-	useTaskHistory: vi.fn(),
-}))
+// taskHistory is read from the TaskHistoryStore singleton now
+// (HistoryView → useTaskSearch → taskHistoryStore.useSelector("history")), so
+// the spec hydrates the real store instead of mocking a hook.
 
 vi.mock("@src/i18n/TranslationContext", () => ({
 	useAppTranslation: () => ({
@@ -23,6 +20,7 @@ vi.mock("@src/i18n/TranslationContext", () => ({
 const mockTaskHistory = [
 	{
 		id: "1",
+		number: 1,
 		task: "Test task 1",
 		ts: Date.now(),
 		tokensIn: 100,
@@ -32,6 +30,7 @@ const mockTaskHistory = [
 	},
 	{
 		id: "2",
+		number: 2,
 		task: "Test task 2",
 		ts: Date.now() + 1000,
 		tokensIn: 200,
@@ -47,7 +46,13 @@ describe("HistoryView", () => {
 		;(useExtensionState as ReturnType<typeof vi.fn>).mockReturnValue({
 			cwd: "/test/workspace",
 		})
-		;(useTaskHistory as ReturnType<typeof vi.fn>).mockReturnValue(mockTaskHistory)
+		// Hydrate the real store singleton the component subscribes to.
+		taskHistoryStore.clear()
+		taskHistoryStore.replaceAll(mockTaskHistory as any)
+	})
+
+	afterEach(() => {
+		taskHistoryStore.clear()
 	})
 
 	it("renders the history interface", () => {

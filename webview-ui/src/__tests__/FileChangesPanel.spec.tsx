@@ -2,6 +2,7 @@ import React from "react"
 import { fireEvent, render, screen } from "@/utils/test-utils"
 import type { ClineMessage } from "@roo-code/types"
 import { TranslationProvider } from "@/i18n/__mocks__/TranslationContext"
+import { clineMessagesStore } from "../context/stores/clineMessagesStore"
 import FileChangesPanel from "../components/chat/FileChangesPanel"
 
 const mockPostMessage = vi.fn()
@@ -65,6 +66,13 @@ function createFileEditMessage(
 }
 
 function renderPanel(messages: ClineMessage[] | undefined) {
+	// The panel derives its content from the store's snapshot (fileChanges /
+	// fileChangesByPath / fileChangesTotalStats), so hydrate the module
+	// singleton with the same messages before mounting.
+	clineMessagesStore.clear(true)
+	if (messages?.length) {
+		clineMessagesStore.replaceAll(messages)
+	}
 	return render(
 		<TranslationProvider>
 			<FileChangesPanel clineMessages={messages} />

@@ -4,6 +4,7 @@ import React from "react"
 import { renderWithExtensionState, waitFor, act, fireEvent } from "@/utils/test-utils"
 
 import { vscode } from "@src/utils/vscode"
+import { clineMessagesStore } from "@src/context/stores/clineMessagesStore"
 
 import ChatView, { ChatViewProps } from "../ChatView"
 
@@ -118,6 +119,10 @@ const hydrateState = (clineMessages: ClineMessage[]) => {
 			state: {
 				version: "1.0.0",
 				clineMessages,
+				// ChatView mounts the streaming area only when currentTaskId is
+				// set (hasActiveTaskArea); the real extension always posts it
+				// once a task exists, so hydrate a stable one here.
+				currentTaskId: "test-task-id",
 				taskHistory: [],
 				shouldShowAnnouncement: false,
 				allowedCommands: [],
@@ -180,7 +185,12 @@ const askOnlyCompletionWithCheckpoint = (): ClineMessage[] => [
 ]
 
 describe("ChatView approval button behavior", () => {
-	beforeEach(() => vi.clearAllMocks())
+	// clineMessagesStore is a module singleton that survives across tests, so
+	// reset it before each test to prevent cross-test pollution.
+	beforeEach(() => {
+		vi.clearAllMocks()
+		clineMessagesStore.clear()
+	})
 
 	it("shows Run/Deny buttons for a command ask that requires manual approval", async () => {
 		const { queryByText } = renderChatView()
