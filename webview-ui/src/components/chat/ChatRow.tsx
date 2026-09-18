@@ -20,7 +20,8 @@ import { COMMAND_OUTPUT_STRING } from "@roo/combineCommandSequences"
 import { safeJsonParse } from "@roo/core"
 
 import { useExtensionState } from "@src/context/ExtensionStateContext"
-import { useClineMessages } from "@src/hooks/useClineMessages"
+import { clineMessagesStore } from "@src/context/stores/clineMessagesStore"
+import { taskHistoryStore } from "@src/context/stores/taskHistoryStore"
 import { findMatchingResourceOrTemplate } from "@src/utils/mcp"
 import { vscode } from "@src/utils/vscode"
 import { formatPathTooltip } from "@src/utils/formatPathTooltip"
@@ -188,20 +189,15 @@ export const ChatRowContent = ({
 }: ChatRowContentProps) => {
 	const { t, i18n } = useTranslation()
 
-	const {
-		mcpServers,
-		alwaysAllowMcp,
-		currentCheckpoint,
-		mode,
-		apiConfiguration,
-		currentTaskItem,
-		enableCheckpoints,
-	} = useExtensionState()
+	const { mcpServers, alwaysAllowMcp, currentCheckpoint, mode, apiConfiguration, enableCheckpoints } =
+		useExtensionState()
 
 	// Commit 2: clineMessages moved out of the context state into
-	// ClineMessagesStore. ChatRowContent reads it from the store hook so the
-	// deepEqual memo on ChatRow isn't bypassed via a live-context subscription.
-	const clineMessages = useClineMessages()
+	// ClineMessagesStore. ChatRowContent reads it through a store selector so
+	// the deepEqual memo on ChatRow isn't bypassed via a live-context
+	// subscription.
+	const [clineMessages] = clineMessagesStore.useSelector("messages")
+	const [currentTaskItem] = taskHistoryStore.useSelector("currentTaskItem")
 	const { info: model } = useSelectedModel(apiConfiguration)
 	const [isEditing, setIsEditing] = useState(false)
 	const [editedContent, setEditedContent] = useState("")

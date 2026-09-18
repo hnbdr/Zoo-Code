@@ -23,26 +23,28 @@
  * always accepted.
  */
 
+import equal from "fast-deep-equal"
+
 import { StringCache, type StringCacheFilter } from "@src/utils/stringCache"
 
 /** Lookup key: `ts` for a ClineMessage, `id` for a HistoryItem. */
 export type RegistryKey = string | number
 
 /**
- * Default content equality. Everything crossing the IPC boundary is plain
- * JSON, so a stringify comparison is exact enough; the `===` fast path covers
- * already-shared references. Stores with a streaming hot path override this to
- * skip the comparison entirely for mid-stream entities (see ClineMessagesStore
- * and its `partial` fast path).
+ * Default content equality: deep value comparison (`fast-deep-equal` starts
+ * with a reference fast path, so already-shared values cost one `===`).
+ * Everything crossing the IPC boundary is plain JSON, which `equal` compares
+ * exactly. Stores with a streaming hot path override this to skip the
+ * comparison entirely for mid-stream entities (see ClineMessagesStore and its
+ * `partial` fast path).
  */
-const jsonEquals = (a: unknown, b: unknown): boolean => a === b || JSON.stringify(a) === JSON.stringify(b)
 
 export interface CanonicalRegistryOptions<T> {
 	/**
 	 * Decides whether an incoming value is the same content as the current
 	 * canonical for its key: true keeps the canonical, false adopts the
 	 * incoming value as the new canonical. Arguments: (incoming, canonical).
-	 * Defaults to JSON equality.
+	 * Defaults to deep value equality.
 	 */
 	contentEquals?: (incoming: T, canonical: T) => boolean
 
@@ -59,7 +61,7 @@ export class CanonicalRegistry<T> {
 	constructor(getKey: (value: T) => RegistryKey, options: CanonicalRegistryOptions<T> = {}) {
 		this.getKey = getKey
 		this.strings = new StringCache(options.shouldInternString)
-		this.contentEquals = options.contentEquals ?? jsonEquals
+		this.contentEquals = options.contentEquals ?? equal
 	}
 
 	/**

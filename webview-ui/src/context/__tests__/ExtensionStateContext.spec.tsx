@@ -16,6 +16,7 @@ import {
 } from "@roo-code/types"
 
 import { ExtensionStateContextProvider, useExtensionState, mergeExtensionState } from "../ExtensionStateContext"
+import { taskHistoryStore } from "../stores/taskHistoryStore"
 
 const TestComponent = () => {
 	const { allowedCommands, setAllowedCommands, soundEnabled, showRooIgnoredFiles, setShowRooIgnoredFiles } =
@@ -59,7 +60,10 @@ const ChatFontSizeTestComponent = () => {
 }
 
 const CurrentTaskItemTestComponent = () => {
-	const { currentTaskItem } = useExtensionState()
+	// `currentTaskItem` moved out of the context into TaskHistoryStore; the sync
+	// assertions observe the store's snapshot through the same selector the app
+	// components use.
+	const [currentTaskItem] = taskHistoryStore.useSelector("currentTaskItem")
 
 	return <div data-testid="current-task-item">{JSON.stringify(currentTaskItem)}</div>
 }

@@ -1,4 +1,4 @@
-import { memo, useEffect, useMemo, useState, useCallback, useRef } from "react"
+import { memo, useEffect, useState, useCallback, useRef } from "react"
 import { useTranslation } from "react-i18next"
 import { ChevronDown, ChevronRight, FileDiff } from "lucide-react"
 import { createTwoFilesPatch } from "diff"
@@ -9,7 +9,7 @@ import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/component
 import { cn } from "@/lib/utils"
 import { vscode } from "@src/utils/vscode"
 
-import { fileChangesFromMessages, type FileChangeEntry } from "./utils/fileChangesFromMessages"
+import { clineMessagesStore } from "../../context/stores/clineMessagesStore"
 import CodeAccordion from "../common/CodeAccordion"
 
 interface FileChangesPanelProps {
@@ -31,30 +31,11 @@ const FileChangesPanel = memo(({ clineMessages, className }: FileChangesPanelPro
 		pendingPathsRef.current = new Set()
 	}, [clineMessages])
 
-	const fileChanges = useMemo(() => fileChangesFromMessages(clineMessages), [clineMessages])
-
-	// Group by path so we show one row per file (multiple edits to same file combined for display)
-	const byPath = useMemo(() => {
-		const map = new Map<string, FileChangeEntry[]>()
-		for (const entry of fileChanges) {
-			const key = entry.path
-			const list = map.get(key) ?? []
-			list.push(entry)
-			map.set(key, list)
-		}
-		return map
-	}, [fileChanges])
-
-	// Aggregate total lines added/removed across all files for the panel header
-	const totalStats = useMemo(() => {
-		return fileChanges.reduce(
-			(acc, e) => ({
-				added: acc.added + (e.diffStats?.added ?? 0),
-				removed: acc.removed + (e.diffStats?.removed ?? 0),
-			}),
-			{ added: 0, removed: 0 },
-		)
-	}, [fileChanges])
+	const [fileChanges, fileChangesByPath, fileChangesTotalStats] = clineMessagesStore.useSelector(
+		"fileChanges",
+		"fileChangesByPath",
+		"fileChangesTotalStats",
+	)
 
 	const togglePath = useCallback((path: string) => {
 		setExpandedPaths((prev) => {
@@ -68,7 +49,7 @@ const FileChangesPanel = memo(({ clineMessages, className }: FileChangesPanelPro
 	// Request final file content when a row is expanded and we have originalContent
 	useEffect(() => {
 		for (const path of expandedPaths) {
-			const entries = byPath.get(path)
+			const entries = fileChangesByPath.get(path)
 			if (!entries?.length) continue
 			const originalContent = entries[0].originalContent
 			const lookupPath = path.startsWith("./") ? path.slice(2) : path
@@ -81,7 +62,7 @@ const FileChangesPanel = memo(({ clineMessages, className }: FileChangesPanelPro
 				vscode.postMessage({ type: "readFileContent", text: lookupPath })
 			}
 		}
-	}, [expandedPaths, byPath, finalContentByPath])
+	}, [expandedPaths, fileChangesByPath, finalContentByPath])
 
 	// Listen for fileContent responses
 	useEffect(() => {
@@ -99,7 +80,7 @@ const FileChangesPanel = memo(({ clineMessages, className }: FileChangesPanelPro
 
 	if (fileChanges.length === 0) return null
 
-	const fileCount = byPath.size
+	const fileCount = fileChangesByPath.size
 
 	return (
 		<Collapsible open={panelExpanded} onOpenChange={setPanelExpanded} className={cn("px-3", className)}>
@@ -117,22 +98,22 @@ const FileChangesPanel = memo(({ clineMessages, className }: FileChangesPanelPro
 				<span className="text-sm font-medium">
 					{t("chat:fileChangesInConversation.header", { count: fileCount })}
 				</span>
-				{totalStats.added > 0 || totalStats.removed > 0 ? (
+				{fileChangesTotalStats.added > 0 || fileChangesTotalStats.removed > 0 ? (
 					<div
 						className="flex items-center gap-2 ml-auto shrink-0"
-						aria-label={`${totalStats.added} lines added, ${totalStats.removed} lines removed`}>
+						aria-label={`${fileChangesTotalStats.added} lines added, ${fileChangesTotalStats.removed} lines removed`}>
 						<span className="text-xs font-medium text-vscode-charts-green" data-testid="total-added">
-							+{totalStats.added}
+							+{fileChangesTotalStats.added}
 						</span>
 						<span className="text-xs font-medium text-vscode-charts-red" data-testid="total-removed">
-							-{totalStats.removed}
+							-{fileChangesTotalStats.removed}
 						</span>
 					</div>
 				) : null}
 			</CollapsibleTrigger>
 			<CollapsibleContent>
 				<div className="flex flex-col gap-1 pb-2 pl-6">
-					{Array.from(byPath.entries()).map(([path, entries]) => {
+					{Array.from(fileChangesByPath.entries()).map(([path, entries]) => {
 						const originalContent = entries[0].originalContent
 						const lookupPath = path.startsWith("./") ? path.slice(2) : path
 						const finalContent = finalContentByPath[lookupPath]

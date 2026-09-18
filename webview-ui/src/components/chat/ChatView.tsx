@@ -44,16 +44,7 @@ import { CheckpointWarning } from "./CheckpointWarning"
 import { QueuedMessages } from "./QueuedMessages"
 import { WorktreeSelector } from "./WorktreeSelector"
 import { useScrollLifecycle } from "@src/hooks/useScrollLifecycle"
-import {
-	useApiMetrics,
-	useLastMessage,
-	useLastMessageFlags,
-	useLatestTodos,
-	useMessageCount,
-	useMessageDerivedSelector,
-	useTask,
-} from "@src/hooks/useClineMessages"
-import { useTaskHistory } from "@src/hooks/useTaskHistory"
+import { taskHistoryStore } from "@src/context/stores/taskHistoryStore"
 import MessageStream from "./MessageStream"
 
 export interface ChatViewProps {
@@ -83,7 +74,6 @@ const ChatViewComponent: React.ForwardRefRenderFunction<ChatViewRef, ChatViewPro
 
 	const {
 		currentTaskId,
-		currentTaskItem,
 		apiConfiguration,
 		organizationAllowList,
 		mode,
@@ -99,26 +89,41 @@ const ChatViewComponent: React.ForwardRefRenderFunction<ChatViewRef, ChatViewPro
 
 	// Task 1 (plans/streaming-event-architecture.md): taskHistory is owned by
 	// TaskHistoryStore now — the HistoryPreview gate below subscribes through
-	// the hook instead of re-rendering with the whole context on every post.
-	const taskHistory = useTaskHistory()
+	// the store selector instead of re-rendering with the whole context on
+	// every post.
+	const [taskHistory, currentTaskItem] = taskHistoryStore.useSelector("history", "currentTaskItem")
 
-	// Derived message data reaches the shell through the store's derived-slice
-	// hooks (plans/derived-store-revision.md §2.3) instead of the old
-	// MessageStream boundary uplink. Every hook selects a field whose reference
-	// the store stabilized (boundary-key for lastMessage, hasTokenUsageChanged
-	// for apiMetrics, JSON signature for latestTodos, primitives elsewhere),
-	// so the shell only re-renders on real boundary events (message appended,
+	// Derived message data reaches the shell through one store selector
+	// (plans/derived-store-revision.md §2.3) instead of the old MessageStream
+	// boundary uplink. Every selected field's reference is stabilized inside
+	// the store (boundary-key for lastMessage, hasTokenUsageChanged for
+	// apiMetrics, JSON signature for latestTodos, primitives elsewhere), so
+	// the shell only re-renders on real boundary events (message appended,
 	// partial->final, ask answered, api request started/finished,
 	// metrics/todos changed) — never while plain text is being appended.
-	// Before the first store flush the derived slice is initial (task
-	// undefined, count 0) — equivalent to the old `boundary === undefined`.
-	const task = useTask()
-	const lastMessage = useLastMessage()
-	const count = useMessageCount()
-	const { lastIsAsk, lastIsPartial, hasOpenApiRequest } = useLastMessageFlags()
-	const hasCompletionResult = useMessageDerivedSelector((derived) => derived.hasCompletionResult)
-	const apiMetrics = useApiMetrics()
-	const latestTodos = useLatestTodos()
+	// Before the first store flush the snapshot is initial (task undefined,
+	// count 0) — equivalent to the old `boundary === undefined`.
+	const [
+		task,
+		lastMessage,
+		count,
+		lastIsAsk,
+		lastIsPartial,
+		hasOpenApiRequest,
+		hasCompletionResult,
+		apiMetrics,
+		latestTodos,
+	] = clineMessagesStore.useSelector(
+		"task",
+		"lastMessage",
+		"count",
+		"lastIsAsk",
+		"lastIsPartial",
+		"hasOpenApiRequest",
+		"hasCompletionResult",
+		"apiMetrics",
+		"latestTodos",
+	)
 
 	// A task is present in the message stream exactly when the derived slice
 	// carries its first row (messages.at(0) is the task row).
@@ -126,7 +131,7 @@ const ChatViewComponent: React.ForwardRefRenderFunction<ChatViewRef, ChatViewPro
 	const hasTaskContent = task !== undefined
 	// currentTaskId is set as soon as the extension creates a task — before the
 	// first store flush reaches us — so we mount MessageStream immediately and
-	// let its derived subscriptions drive the TaskHeader/welcome switch.
+	// let its derived subscriptions drive the Task`Header/welcome switch.
 	const hasActiveTaskArea = currentTaskId != null
 
 	// Show a WarningRow when the user sends a message with a retired provider.
@@ -546,7 +551,7 @@ const ChatViewComponent: React.ForwardRefRenderFunction<ChatViewRef, ChatViewPro
 	const markFollowUpAsAnswered = useCallback(() => {
 		const lastFollowUpMessage = clineMessagesStore
 			.getSnapshot()
-			.findLast((msg: ClineMessage) => msg.ask === "followup")
+			.messages.findLast((msg: ClineMessage) => msg.ask === "followup")
 		if (lastFollowUpMessage) {
 			setCurrentFollowUpTs(lastFollowUpMessage.ts)
 		}
@@ -617,9 +622,10 @@ const ChatViewComponent: React.ForwardRefRenderFunction<ChatViewRef, ChatViewPro
 				// Mark that user has responded - this prevents any pending auto-approvals.
 				userRespondedRef.current = true
 
-				// The shell is not subscribed to the store, so read the snapshot
-				// imperatively on user interaction (never during render).
-				if (clineMessagesStore.getSnapshot().length === 0) {
+				// The shell's selector only re-renders on boundary events, so read the
+				// live message array imperatively on user interaction (never during
+				// render).
+				if (clineMessagesStore.getSnapshot().messages.length === 0) {
 					vscode.postMessage({ type: "newTask", text, images })
 				} else if (clineAskRef.current) {
 					if (clineAskRef.current === "followup") {
@@ -755,7 +761,7 @@ const ChatViewComponent: React.ForwardRefRenderFunction<ChatViewRef, ChatViewPro
 						currentTaskItem?.parentTaskId &&
 						clineMessagesStore
 							.getSnapshot()
-							.some((msg) => msg.ask === "completion_result" || msg.say === "completion_result")
+							.messages.some((msg) => msg.ask === "completion_result" || msg.say === "completion_result")
 					if (isCompletedSubtaskForClick) {
 						startNewTask()
 					} else {

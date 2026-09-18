@@ -1,6 +1,6 @@
-import { type HistoryItem } from "@roo-code/types"
+import { type ExtensionMessage, type HistoryItem } from "@roo-code/types"
 
-import { createTaskHistoryStore } from "../taskHistoryStore"
+import { TaskHistoryStore } from "../taskHistoryStore"
 
 // Minimal factory matching the real HistoryItem shape used across webview tests
 // (id/number/ts/task/token/cost fields; optionals omitted per item).
@@ -15,17 +15,30 @@ const makeItem = (id: string, ts: number, task = `task ${id}`): HistoryItem =>
 		totalCost: 0,
 	}) as HistoryItem
 
-// window.postMessage is async in jsdom, so tests use a synchronous dispatch —
-// the same pattern as ClineMessagesStore.spec.ts.
-const dispatchWindowMessage = (data: unknown) => {
-	window.dispatchEvent(new MessageEvent("message", { data }))
-}
-
 describe("TaskHistoryStore", () => {
-	let store: ReturnType<typeof createTaskHistoryStore>
+	let store: TaskHistoryStore
+
+	// The store no longer self-hydrates from a window listener: the provider
+	// routes every ExtensionMessage into its public handlers (see handleMessage
+	// in ExtensionStateContext.tsx). Mirror that routing on the local instance
+	// so history posts flow through the same entry points production uses.
+	const dispatchWindowMessage = (data: unknown) => {
+		const message = data as ExtensionMessage
+		switch (message.type) {
+			case "state":
+				store.handleState(message)
+				break
+			case "taskHistoryUpdated":
+				store.handleTaskHistoryUpdated(message)
+				break
+			case "taskHistoryItemUpdated":
+				store.handleTaskHistoryItemUpdated(message)
+				break
+		}
+	}
 
 	beforeEach(() => {
-		store = createTaskHistoryStore()
+		store = new TaskHistoryStore()
 	})
 
 	describe("replaceAll", () => {
@@ -33,7 +46,7 @@ describe("TaskHistoryStore", () => {
 			const items = [makeItem("1", 200), makeItem("2", 100)]
 			store.replaceAll(items)
 
-			expect(store.getSnapshot()).toBe(items)
+			expect(store.getSnapshot().history).toBe(items)
 		})
 
 		it("replaces the previous array entirely", () => {
@@ -41,9 +54,9 @@ describe("TaskHistoryStore", () => {
 			const fresh = [makeItem("new", 2)]
 			store.replaceAll(fresh)
 
-			expect(store.getSnapshot()).toBe(fresh)
-			expect(store.getSnapshot()).toHaveLength(1)
-			expect(store.getSnapshot()[0]?.id).toBe("new")
+			expect(store.getSnapshot().history).toBe(fresh)
+			expect(store.getSnapshot().history).toHaveLength(1)
+			expect(store.getSnapshot().history[0]?.id).toBe("new")
 		})
 
 		it("replaceAll([]) empties a previously-hydrated history and notifies", () => {
@@ -54,20 +67,21 @@ describe("TaskHistoryStore", () => {
 			store.replaceAll([])
 
 			expect(listener).toHaveBeenCalledTimes(1)
-			expect(store.getSnapshot()).toEqual([])
+			expect(store.getSnapshot().history).toEqual([])
 		})
+
 		it("keeps canonical element references across identical-content re-posts", () => {
 			store.replaceAll([makeItem("1", 200), makeItem("2", 100)])
-			const canonical = store.getSnapshot()
+			const canonical = store.getSnapshot().history
 
 			// Structured-clone twin of the same content: every item maps back to
 			// its registered canonical → the snapshot keeps its reference.
 			store.replaceAll([makeItem("1", 200), makeItem("2", 100)])
-			expect(store.getSnapshot()).toBe(canonical)
+			expect(store.getSnapshot().history).toBe(canonical)
 
 			// Changed content IS adopted; the untouched item keeps its reference.
 			store.replaceAll([makeItem("1", 200, "renamed"), makeItem("2", 100)])
-			const next = store.getSnapshot()
+			const next = store.getSnapshot().history
 			expect(next).not.toBe(canonical)
 			expect(next[0]).not.toBe(canonical[0])
 			expect(next[0]?.task).toBe("renamed")
@@ -83,11 +97,11 @@ describe("TaskHistoryStore", () => {
 			const updated = makeItem("2", 200, "updated task")
 			store.upsertItem(updated)
 
-			const snapshot = store.getSnapshot()
-			expect(snapshot).toHaveLength(2)
-			expect(snapshot[1]).toBe(updated)
+			const history = store.getSnapshot().history
+			expect(history).toHaveLength(2)
+			expect(history[1]).toBe(updated)
 			// Unrelated element keeps its reference and position.
-			expect(snapshot[0]).toBe(untouched)
+			expect(history[0]).toBe(untouched)
 		})
 
 		it("prepends an unknown id", () => {
@@ -97,10 +111,10 @@ describe("TaskHistoryStore", () => {
 			const incoming = makeItem("9", 999)
 			store.upsertItem(incoming)
 
-			expect(store.getSnapshot().map((item) => item.id)).toEqual(["9", "1"])
-			expect(store.getSnapshot()[0]).toBe(incoming)
+			expect(store.getSnapshot().history.map((item) => item.id)).toEqual(["9", "1"])
+			expect(store.getSnapshot().history[0]).toBe(incoming)
 			// The untouched existing element keeps its reference.
-			expect(store.getSnapshot()[1]).toBe(existing)
+			expect(store.getSnapshot().history[1]).toBe(existing)
 		})
 
 		it("re-sorts newest-first after the merge", () => {
@@ -109,14 +123,14 @@ describe("TaskHistoryStore", () => {
 
 			store.upsertItem(makeItem("3", 250))
 
-			expect(store.getSnapshot().map((item) => item.ts)).toEqual([300, 250, 200])
+			expect(store.getSnapshot().history.map((item) => item.ts)).toEqual([300, 250, 200])
 		})
 
 		it("into an empty history: results in a one-element list", () => {
 			const item = makeItem("1", 100)
 			store.upsertItem(item)
 
-			expect(store.getSnapshot()).toEqual([item])
+			expect(store.getSnapshot().history).toEqual([item])
 		})
 	})
 
@@ -168,7 +182,7 @@ describe("TaskHistoryStore", () => {
 			store.upsertItem(makeItem("1", 100, "renamed"))
 
 			expect(listener).toHaveBeenCalledTimes(1)
-			expect(store.getSnapshot()[0]?.task).toBe("renamed")
+			expect(store.getSnapshot().history[0]?.task).toBe("renamed")
 		})
 
 		it("clear() notifies even from an already-empty history (fresh [] reference)", () => {
@@ -178,12 +192,12 @@ describe("TaskHistoryStore", () => {
 			store.clear()
 
 			expect(listener).toHaveBeenCalledTimes(1)
-			expect(store.getSnapshot()).toEqual([])
+			expect(store.getSnapshot().history).toEqual([])
 		})
 
 		it("clear() drops the registry so identical content is adopted as new canonicals", () => {
 			store.replaceAll([makeItem("1", 100)])
-			const before = store.getSnapshot()[0]
+			const before = store.getSnapshot().history[0]
 
 			store.clear()
 
@@ -191,7 +205,7 @@ describe("TaskHistoryStore", () => {
 			// NEW reference (proves clear() reset the registry, not just the
 			// snapshot).
 			store.replaceAll([makeItem("1", 100)])
-			expect(store.getSnapshot()[0]).not.toBe(before)
+			expect(store.getSnapshot().history[0]).not.toBe(before)
 		})
 
 		it("notifies every listener; unsubscribing one leaves the others attached", () => {
@@ -216,7 +230,7 @@ describe("TaskHistoryStore", () => {
 
 			store.clear()
 			expect(store.getCacheSize()).toBe(0)
-			expect(store.getSnapshot()).toEqual([])
+			expect(store.getSnapshot().history).toEqual([])
 		})
 
 		it("deduplicates strings across posts: a repeated post does not grow the cache", () => {
@@ -238,81 +252,73 @@ describe("TaskHistoryStore", () => {
 
 	describe("self-hydration (window message listener)", () => {
 		it("hydrates from a full state post carrying taskHistory", () => {
-			store.start()
 			const items = [makeItem("1", 100)]
 
 			dispatchWindowMessage({ type: "state", state: { taskHistory: items } })
 
-			expect(store.getSnapshot()).toBe(items)
+			expect(store.getSnapshot().history).toBe(items)
 		})
 
 		it("keeps the current list when a lean state post omits the taskHistory key (Commit 4)", () => {
 			// The extension conditionally spreads taskHistory — lean posts must
 			// not wipe the history.
-			store.start()
 			const items = [makeItem("1", 100)]
 			dispatchWindowMessage({ type: "state", state: { taskHistory: items } })
 
 			dispatchWindowMessage({ type: "state", state: { version: "1.2.3" } })
 
-			expect(store.getSnapshot()).toBe(items)
+			expect(store.getSnapshot().history).toBe(items)
 		})
 
 		it("applies taskHistoryUpdated via replaceAll", () => {
-			store.start()
 			const items = [makeItem("1", 100), makeItem("2", 200)]
 
 			dispatchWindowMessage({ type: "taskHistoryUpdated", taskHistory: items })
 
-			expect(store.getSnapshot()).toBe(items)
+			expect(store.getSnapshot().history).toBe(items)
 		})
 
 		it("applies taskHistoryItemUpdated via upsertItem", () => {
-			store.start()
 			dispatchWindowMessage({ type: "taskHistoryUpdated", taskHistory: [makeItem("1", 100)] })
 
 			const updated = makeItem("1", 100, "renamed")
 			dispatchWindowMessage({ type: "taskHistoryItemUpdated", taskHistoryItem: updated })
 
-			const snapshot = store.getSnapshot()
-			expect(snapshot).toHaveLength(1)
-			expect(snapshot[0]).toBe(updated)
+			const history = store.getSnapshot().history
+			expect(history).toHaveLength(1)
+			expect(history[0]).toBe(updated)
 		})
 
 		it("ignores taskHistoryItemUpdated without an item", () => {
-			store.start()
 			const items = [makeItem("1", 100)]
 			dispatchWindowMessage({ type: "state", state: { taskHistory: items } })
 
 			dispatchWindowMessage({ type: "taskHistoryItemUpdated" })
 
-			expect(store.getSnapshot()).toBe(items)
+			expect(store.getSnapshot().history).toBe(items)
 		})
 
 		it("keeps the list on a state post carrying an explicit taskHistory: undefined", () => {
 			// The lean-post guard must treat an explicitly-undefined key like an
 			// absent one (structured-clone can deliver either shape).
-			store.start()
 			const items = [makeItem("1", 100)]
 			dispatchWindowMessage({ type: "state", state: { taskHistory: items } })
 
 			dispatchWindowMessage({ type: "state", state: { taskHistory: undefined } })
 
-			expect(store.getSnapshot()).toBe(items)
+			expect(store.getSnapshot().history).toBe(items)
 		})
 
 		it("keeps the list on taskHistoryUpdated without a payload", () => {
-			store.start()
 			const items = [makeItem("1", 100)]
 			dispatchWindowMessage({ type: "taskHistoryUpdated", taskHistory: items })
 
 			dispatchWindowMessage({ type: "taskHistoryUpdated" })
 
-			expect(store.getSnapshot()).toBe(items)
+			expect(store.getSnapshot().history).toBe(items)
 		})
 
 		it("ignores unrelated message types", () => {
-			store.start()
 			const listener = vi.fn()
 			store.subscribe(listener)
 
@@ -322,31 +328,8 @@ describe("TaskHistoryStore", () => {
 			})
 			dispatchWindowMessage({ type: "somethingElse" })
 
-			expect(store.getSnapshot()).toEqual([])
+			expect(store.getSnapshot().history).toEqual([])
 			expect(listener).not.toHaveBeenCalled()
-		})
-
-		it("stop() detaches the listener; stop() without start() is safe", () => {
-			store.stop()
-
-			store.start()
-			store.stop()
-			store.stop()
-
-			dispatchWindowMessage({ type: "state", state: { taskHistory: [makeItem("1", 100)] } })
-
-			expect(store.getSnapshot()).toEqual([])
-		})
-
-		it("start() is idempotent (a double start does not double-apply)", () => {
-			store.start()
-			store.start()
-			const listener = vi.fn()
-			store.subscribe(listener)
-
-			dispatchWindowMessage({ type: "state", state: { taskHistory: [makeItem("1", 100)] } })
-
-			expect(listener).toHaveBeenCalledTimes(1)
 		})
 	})
 })

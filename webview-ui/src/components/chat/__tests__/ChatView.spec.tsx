@@ -93,16 +93,16 @@ const mockTaskHeaderState = vi.hoisted(() => ({
 
 vi.mock("../TaskHeader", async () => {
 	// Commit 2: the real TaskHeader reads the task message from the streaming
-	// store via useClineMessagesSelector (messages.at(0)) instead of a `task`
+	// store via clineMessagesStore.useSelector("task") instead of a `task`
 	// prop. The mock mirrors that so `data-task-id` stays driven by store data.
-	// The factory is hoisted above the spec's imports, so the hook module must
+	// The factory is hoisted above the spec's imports, so the store module must
 	// be loaded with `await import()` (resolved through the vitest module graph
 	// — `require` cannot load TS modules here).
-	const { useClineMessagesSelector } = await import("../../../hooks/useClineMessages")
+	const { clineMessagesStore } = await import("@src/context/stores/clineMessagesStore")
 
 	return {
 		default: function MockTaskHeader({ aggregatedCost }: { aggregatedCost?: number }) {
-			const task = useClineMessagesSelector((messages) => messages.at(0))
+			const [task] = clineMessagesStore.useSelector("task")
 			mockTaskHeaderState.renders.push({ taskId: task?.text, aggregatedCost })
 
 			return (

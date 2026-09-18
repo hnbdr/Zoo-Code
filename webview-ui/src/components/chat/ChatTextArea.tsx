@@ -11,8 +11,8 @@ import { Mode, getAllModes } from "@roo/modes"
 
 import { vscode } from "@src/utils/vscode"
 import { useExtensionState } from "@src/context/ExtensionStateContext"
-import { useClineMessages } from "@src/hooks/useClineMessages"
-import { useTaskHistory } from "@src/hooks/useTaskHistory"
+import { clineMessagesStore } from "@src/context/stores/clineMessagesStore"
+import { taskHistoryStore } from "@src/context/stores/taskHistoryStore"
 import { useAppTranslation } from "@src/i18n/TranslationContext"
 import {
 	ContextMenuOptionType,
@@ -106,14 +106,12 @@ export const ChatTextArea = forwardRef<HTMLTextAreaElement, ChatTextAreaProps>(
 			lockApiConfigAcrossModes,
 		} = useExtensionState()
 
-		// Commit 2: clineMessages moved out of the context state into
-		// ClineMessagesStore. ChatTextArea only consumes messages for prompt
-		// history navigation (user interaction), per plan §7.4.
-		const clineMessages = useClineMessages()
-		// Task 1: taskHistory moved out of the context state into
-		// TaskHistoryStore — same subscription pattern, consumed by
-		// usePromptHistory below.
-		const taskHistory = useTaskHistory()
+		// Prompt history consumes store-derived string lists instead of the raw
+		// messages/history arrays: the derived references only change when the
+		// prompt content actually changes, so streaming tokens (which churn
+		// `messages`) no longer re-render ChatTextArea. See promptHistory.ts.
+		const [conversationPrompts] = clineMessagesStore.useSelector("conversationPrompts")
+		const [taskHistoryPrompts] = taskHistoryStore.useSelector("taskHistoryPrompts")
 
 		// Find the ID and display text for the currently selected API configuration.
 		const { currentConfigId, displayName } = useMemo(() => {
@@ -240,9 +238,8 @@ export const ChatTextArea = forwardRef<HTMLTextAreaElement, ChatTextAreaProps>(
 
 		// Use custom hook for prompt history navigation
 		const { handleHistoryNavigation, resetHistoryNavigation, resetOnInputChange } = usePromptHistory({
-			clineMessages,
-			taskHistory,
-			cwd,
+			conversationPrompts,
+			taskHistoryPrompts,
 			inputValue: normalizedInputValue,
 			setInputValue,
 		})

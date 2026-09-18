@@ -7,6 +7,7 @@ import { renderWithExtensionState, screen, fireEvent, act } from "@/utils/test-u
 import type { ClineMessage, ProviderSettings } from "@roo-code/types"
 
 import { clineMessagesStore } from "@src/context/stores/clineMessagesStore"
+import { taskHistoryStore } from "@src/context/stores/taskHistoryStore"
 
 import TaskHeader, { TaskHeaderProps } from "../TaskHeader"
 
@@ -105,9 +106,9 @@ vi.mock("../Mention", () => ({
 }))
 
 // Commit 2: TaskHeader reads the task message through the REAL
-// useClineMessagesSelector (no module-level hook mock anymore), so every test
-// hydrates the store singleton directly. Task-say message factory matching the
-// minimal ClineMessage shape used elsewhere (ts/text/type/say).
+// clineMessagesStore.useSelector (no module-level hook mock anymore), so every
+// test hydrates the store singleton directly. Task-say message factory matching
+// the minimal ClineMessage shape used elsewhere (ts/text/type/say).
 const makeTaskMessage = (ts: number, text: string): ClineMessage =>
 	({ type: "say", say: "task", ts, text }) as ClineMessage
 
@@ -122,13 +123,18 @@ describe("TaskHeader", () => {
 	}
 
 	const renderTaskHeader = (props: Partial<TaskHeaderProps> = {}) => {
+		// TaskHeader reads `currentTaskItem` from the real taskHistoryStore
+		// singleton now, so seed it from the mock state right before mounting
+		// (the banner tests mutate `currentTaskItem` after beforeEach).
+		taskHistoryStore.clear()
+		taskHistoryStore.hydrate({ currentTaskItem: (mockExtensionState.currentTaskItem ?? undefined) as any })
 		return renderWithExtensionState(<TaskHeader {...defaultProps} {...props} />)
 	}
 
 	// Commit 2: TaskHeader reads the task message from the store singleton via
-	// the real useClineMessagesSelector. Every test starts from a clean store
-	// with one task message ("Test task" — the text the existing assertions
-	// expect), matching the previous module-level hook mock.
+	// the real clineMessagesStore.useSelector("task"). Every test starts from a
+	// clean store with one task message ("Test task" — the text the existing
+	// assertions expect), matching the previous module-level hook mock.
 	beforeEach(() => {
 		MentionSpy.mockClear()
 		clineMessagesStore.clear()

@@ -4,6 +4,7 @@ import { act, fireEvent, renderWithExtensionState } from "@/utils/test-utils"
 import type { ClineMessage } from "@roo-code/types"
 
 import { vscode } from "@src/utils/vscode"
+import { clineMessagesStore } from "@src/context/stores/clineMessagesStore"
 
 import ChatView, { type ChatViewProps } from "../ChatView"
 
@@ -14,6 +15,10 @@ interface ExtensionStateMessage {
 	state: {
 		version: string
 		clineMessages: ClineMessage[]
+		// ChatView mounts the streaming area only when currentTaskId is set
+		// (hasActiveTaskArea); the real extension always posts it once a task
+		// exists, so hydrate a stable one here.
+		currentTaskId: string
 		taskHistory: unknown[]
 		shouldShowAnnouncement: boolean
 		allowedCommands: string[]
@@ -246,6 +251,7 @@ const postState = (clineMessages: ClineMessage[]) => {
 		state: {
 			version: "1.0.0",
 			clineMessages,
+			currentTaskId: "test-task-id",
 			taskHistory: [],
 			shouldShowAnnouncement: false,
 			allowedCommands: [],
@@ -373,6 +379,9 @@ describe("ChatView scroll behavior regression coverage", () => {
 	beforeEach(() => {
 		vi.useFakeTimers()
 		vi.mocked(vscode.postMessage).mockClear()
+		// clineMessagesStore is a module singleton that survives across tests,
+		// so reset it before each test to prevent cross-test pollution.
+		clineMessagesStore.clear(true)
 		harness.scrollCalls = 0
 		harness.scrollToIndexArgs = []
 		harness.atBottomAfterCalls = Number.POSITIVE_INFINITY

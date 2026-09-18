@@ -3,7 +3,7 @@ import { Fzf } from "fzf"
 
 import { highlightFzfMatch } from "@/utils/highlight"
 import { useExtensionState } from "@/context/ExtensionStateContext"
-import { useTaskHistory } from "@/hooks/useTaskHistory"
+import { taskHistoryStore } from "@/context/stores/taskHistoryStore"
 
 type SortOption = "newest" | "oldest" | "mostExpensive" | "mostTokens" | "mostRelevant"
 
@@ -11,7 +11,7 @@ export const useTaskSearch = () => {
 	// Task 1 (plans/streaming-event-architecture.md): taskHistory is no longer
 	// context state — the store subscription re-renders only this hook's
 	// consumers when the history snapshot changes, not the whole context tree.
-	const taskHistory = useTaskHistory()
+	const [taskHistory] = taskHistoryStore.useSelector("history")
 	const { cwd } = useExtensionState()
 	const [searchQuery, setSearchQuery] = useState("")
 	const [sortOption, setSortOption] = useState<SortOption>("newest")
